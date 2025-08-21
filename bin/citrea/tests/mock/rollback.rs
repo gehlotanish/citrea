@@ -8,9 +8,8 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, U256};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag};
-use citrea_common::{BatchProverConfig, SequencerConfig};
+use citrea_common::{BatchProverConfig, NodeType, SequencerConfig};
 use citrea_stf::genesis_config::GenesisPaths;
-use citrea_storage_ops::pruning::types::StorageNodeType;
 use citrea_storage_ops::rollback::Rollback;
 use futures::FutureExt;
 use reth_tasks::TaskManager;
@@ -165,7 +164,7 @@ async fn start_batch_prover(
 }
 
 async fn rollback_node(
-    node_type: StorageNodeType,
+    node_type: NodeType,
     tables: &[&str],
     old_path: &Path,
     new_path: &Path,
@@ -181,10 +180,9 @@ async fn rollback_node(
     rollback
         .execute(
             node_type,
-            50,
-            rollback_l2_height,
-            rollback_l1_height,
-            commitment_index,
+            Some(rollback_l2_height),
+            Some(rollback_l1_height),
+            Some(commitment_index),
         )
         .await
         .unwrap();
@@ -320,7 +318,7 @@ async fn test_sequencer_rollback() -> Result<(), anyhow::Error> {
     let rollback_index = 1;
     let new_sequencer_db_dir = storage_dir.path().join("sequencer2").to_path_buf();
     rollback_node(
-        StorageNodeType::Sequencer,
+        NodeType::Sequencer,
         SEQUENCER_LEDGER_TABLES,
         &sequencer_db_dir,
         &new_sequencer_db_dir,
@@ -414,7 +412,7 @@ async fn test_fullnode_rollback() -> Result<(), anyhow::Error> {
 
     let new_sequencer_db_dir = storage_dir.path().join("sequencer2").to_path_buf();
     rollback_node(
-        StorageNodeType::Sequencer,
+        NodeType::Sequencer,
         SEQUENCER_LEDGER_TABLES,
         &sequencer_db_dir,
         &new_sequencer_db_dir,
@@ -430,7 +428,7 @@ async fn test_fullnode_rollback() -> Result<(), anyhow::Error> {
     //------------------
     let new_full_node_db_dir = storage_dir.path().join("full-node2").to_path_buf();
     rollback_node(
-        StorageNodeType::FullNode,
+        NodeType::FullNode,
         FULL_NODE_LEDGER_TABLES,
         &full_node_db_dir,
         &new_full_node_db_dir,
@@ -484,7 +482,7 @@ async fn test_fullnode_rollback() -> Result<(), anyhow::Error> {
 }
 
 /// Trigger rollback DB data.
-/// This test makes sure that a rollback on fullnode withour rolling back sequencer
+/// This test makes sure that a rollback on fullnode without rolling back sequencer
 /// enables fullnode to sync from the rollback point up until latest sequencer block.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fullnode_rollback_without_sequencer_rollback() -> Result<(), anyhow::Error> {
@@ -537,7 +535,7 @@ async fn test_fullnode_rollback_without_sequencer_rollback() -> Result<(), anyho
 
     let new_full_node_db_dir = storage_dir.path().join("full-node2").to_path_buf();
     rollback_node(
-        StorageNodeType::FullNode,
+        NodeType::FullNode,
         FULL_NODE_LEDGER_TABLES,
         &full_node_db_dir,
         &new_full_node_db_dir,
@@ -717,7 +715,7 @@ async fn test_batch_prover_rollback() -> Result<(), anyhow::Error> {
     //------------------
     let new_sequencer_db_dir = storage_dir.path().join("sequencer3").to_path_buf();
     rollback_node(
-        StorageNodeType::Sequencer,
+        NodeType::Sequencer,
         SEQUENCER_LEDGER_TABLES,
         &sequencer_db_dir,
         &new_sequencer_db_dir,
@@ -729,7 +727,7 @@ async fn test_batch_prover_rollback() -> Result<(), anyhow::Error> {
     .unwrap();
 
     rollback_node(
-        StorageNodeType::FullNode,
+        NodeType::FullNode,
         FULL_NODE_LEDGER_TABLES,
         &full_node_db_dir,
         &new_full_node_db_dir,
@@ -741,7 +739,7 @@ async fn test_batch_prover_rollback() -> Result<(), anyhow::Error> {
     .unwrap();
 
     rollback_node(
-        StorageNodeType::BatchProver,
+        NodeType::BatchProver,
         BATCH_PROVER_LEDGER_TABLES,
         &batch_prover_db_dir,
         &new_batch_prover_db_dir,

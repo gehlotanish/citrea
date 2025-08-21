@@ -4,16 +4,15 @@ use std::sync::Arc;
 
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::types::error::{INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG};
-use jsonrpsee::types::ErrorObjectOwned;
 use serde::{Deserialize, Serialize};
 use sov_db::ledger_db::LedgerDB;
 
 use super::{BackupManager, CreateBackupInfo};
+use crate::rpc::utils::internal_rpc_error;
 
 /// Response from backup validation request
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidationResponse {
+pub struct BackupValidationResponse {
     /// Path that was validated
     pub backup_path: PathBuf,
     /// Whether the backup at the path is valid
@@ -38,10 +37,14 @@ pub struct BackupInfoResponse {
 #[rpc(client, server, namespace = "backup")]
 pub trait BackupRpc {
     #[method(name = "create")]
-    async fn backup_create(&self, path: Option<PathBuf>) -> RpcResult<CreateBackupInfo>;
+    async fn backup_create(
+        &self,
+        path: Option<PathBuf>,
+        n_to_keep: Option<u32>,
+    ) -> RpcResult<CreateBackupInfo>;
 
     #[method(name = "validate")]
-    async fn backup_validate(&self, path: PathBuf) -> RpcResult<ValidationResponse>;
+    async fn backup_validate(&self, path: PathBuf) -> RpcResult<BackupValidationResponse>;
 
     #[method(name = "info")]
     async fn backup_info(
@@ -66,27 +69,35 @@ impl BackupRpcServerImpl {
 
 #[async_trait::async_trait]
 impl BackupRpcServer for BackupRpcServerImpl {
-    async fn backup_create(&self, path: Option<PathBuf>) -> RpcResult<CreateBackupInfo> {
-        self.backup_manager
+    async fn backup_create(
+        &self,
+        path: Option<PathBuf>,
+        n_to_keep: Option<u32>,
+    ) -> RpcResult<CreateBackupInfo> {
+        let result = self
+            .backup_manager
             .create_backup(path, &self.ledger_db)
             .await
-            .map_err(|e| {
-                ErrorObjectOwned::owned(
-                    INTERNAL_ERROR_CODE,
-                    INTERNAL_ERROR_MSG,
-                    Some(format!("{e}")),
-                )
-            })
+            .map_err(internal_rpc_error)?;
+
+        if let Some(n_to_keep) = n_to_keep {
+            self.backup_manager
+                .purge_backup(result.backup_path.clone(), Some(n_to_keep), None)
+                .await
+                .map_err(internal_rpc_error)?;
+        }
+
+        Ok(result)
     }
 
-    async fn backup_validate(&self, path: PathBuf) -> RpcResult<ValidationResponse> {
+    async fn backup_validate(&self, path: PathBuf) -> RpcResult<BackupValidationResponse> {
         let res = match self.backup_manager.validate_backup(&path) {
-            Ok(()) => ValidationResponse {
+            Ok(()) => BackupValidationResponse {
                 backup_path: path,
                 is_valid: true,
                 message: None,
             },
-            Err(e) => ValidationResponse {
+            Err(e) => BackupValidationResponse {
                 backup_path: path,
                 is_valid: false,
                 message: Some(e.to_string()),
@@ -118,13 +129,7 @@ impl BackupRpcServer for BackupRpcServerImpl {
                     })
                     .collect()
             })
-            .map_err(|e| {
-                ErrorObjectOwned::owned(
-                    INTERNAL_ERROR_CODE,
-                    INTERNAL_ERROR_MSG,
-                    Some(format!("{e}")),
-                )
-            })
+            .map_err(internal_rpc_error)
     }
 }
 

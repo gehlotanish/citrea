@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
-use metrics::histogram;
+use metrics::gauge;
 use risc0_zkvm::{
     AssumptionReceipt, ExecutorEnvBuilder, ExternalProver, ProveInfo, Prover, ProverOpts,
 };
@@ -29,6 +29,14 @@ impl LocalProver {
 
         let dev_mode = env::var("RISC0_DEV_MODE").is_ok();
         let r0vm_path = get_r0vm_path().expect("Could not get r0vm path");
+
+        // Check if the version of the r0vm matches the version of the risc0 crate
+        // the `get_r0vm_path` function will return the path to the r0vm binary with the correct version
+        // IF the version is installed
+        // else the function will just return "r0vm" as path
+        // then we'd be defaulting to the system default
+        // so we need to check if the version is correct
+        compare_risc0_versions(&r0vm_path).expect("Something is wrong with system r0vm");
 
         Self {
             dev_mode,
@@ -69,7 +77,7 @@ impl LocalProver {
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
         tokio::task::spawn_blocking(move || {
-            match this.handle_prove(elf, input, assumptions, prover_opts) {
+            match this.handle_prove(job_id, elf, input, assumptions, prover_opts) {
                 Ok(proof) => {
                     let _ = tx.send(ProofWithJob { job_id, proof });
                 }
@@ -82,6 +90,7 @@ impl LocalProver {
 
     fn handle_prove(
         &self,
+        job_id: Uuid,
         elf: Vec<u8>,
         input: Vec<u8>,
         assumptions: Vec<AssumptionReceipt>,
@@ -99,9 +108,6 @@ impl LocalProver {
 
         #[cfg(feature = "testing")]
         {
-            // If we are testing, set guest env var to enable dev mode so that it verifies fake receipts
-            env.env_var("RISC0_DEV_MODE", "1");
-
             match self.network {
                 Network::Nightly => {}
                 Network::TestNetworkWithForks => {
@@ -109,11 +115,6 @@ impl LocalProver {
                 }
                 _ => panic!("Invalid network in testing feature!"),
             }
-        }
-
-        if self.dev_mode {
-            // on dev mode always propagate dev mode to the guest
-            env.env_var("RISC0_DEV_MODE", "1");
         }
 
         // Add input
@@ -124,8 +125,8 @@ impl LocalProver {
             .prove_with_opts(env, &elf, &prover_opts)
             .map_err(|e| anyhow!("Local risc0 proving failed: {}", e))?;
 
-        tracing::info!("Execution Stats: {:?}", stats);
-        histogram!("proving_session_cycle_count").record(stats.total_cycles as f64);
+        tracing::info!("Execution Stats for job_id={}: {:?}", job_id, stats);
+        gauge!("proving_session_cycle_count").set(stats.total_cycles as f64);
 
         Ok(bincode::serialize(&receipt.inner).expect("Receipt serialization cannot fail"))
     }
@@ -158,4 +159,38 @@ fn get_r0vm_path() -> anyhow::Result<PathBuf> {
     }
 
     Ok("r0vm".into())
+}
+
+fn compare_risc0_versions(r0vm_path: &PathBuf) -> anyhow::Result<()> {
+    let version = risc0_zkvm::get_version()?.to_string();
+
+    let output = std::process::Command::new(r0vm_path)
+        .arg("--version")
+        .output()
+        .map_err(|e| anyhow!("Failed to execute r0vm: {}", e))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to get version from r0vm: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let output = String::from_utf8(output.stdout)
+        .map_err(|e| anyhow!("Failed to parse r0vm version output: {}", e))?;
+
+    let r0vm_version = output
+        .trim()
+        .strip_prefix("risc0-r0vm ")
+        .expect("r0vm must return version string in this format");
+
+    if version != r0vm_version {
+        return Err(anyhow!(
+            "RISC0 version {} does not match r0vm version {}",
+            version,
+            r0vm_version
+        ));
+    }
+
+    Ok(())
 }

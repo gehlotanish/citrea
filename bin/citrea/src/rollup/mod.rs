@@ -7,17 +7,16 @@ use citrea_batch_prover::prover::Prover;
 use citrea_batch_prover::L2Syncer as BatchProverL2Syncer;
 use citrea_common::backup::BackupManager;
 use citrea_common::{
-    BatchProverConfig, FullNodeConfig, InitParams, LightClientProverConfig, SequencerConfig,
+    BatchProverConfig, FullNodeConfig, InitParams, LightClientProverConfig, NodeType,
+    SequencerConfig,
 };
 use citrea_fullnode::da_block_handler::L1BlockHandler as FullNodeL1BlockHandler;
 use citrea_fullnode::L2Syncer as FullNodeL2Syncer;
 use citrea_light_client_prover::circuit::initial_values::InitialValueProvider;
 use citrea_light_client_prover::da_block_handler::L1BlockHandler as LightClientProverL1BlockHandler;
-use citrea_light_client_prover::runner::CitreaLightClientProver;
 use citrea_primitives::forks::get_forks;
 use citrea_sequencer::CitreaSequencer;
 use citrea_stf::runtime::{CitreaRuntime, DefaultContext};
-use citrea_storage_ops::pruning::types::StorageNodeType;
 use citrea_storage_ops::pruning::PrunerService;
 use citrea_storage_ops::rollback::Rollback;
 use jsonrpsee::RpcModule;
@@ -77,10 +76,16 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
         &self,
         rollup_config: &FullNodeConfig<Self::DaConfig>,
         require_da_wallet: bool,
+        network: Network,
     ) -> Result<Dependencies<Self>> {
         let task_manager = TaskManager::current();
         let da_service = self
-            .create_da_service(rollup_config, require_da_wallet, task_manager.executor())
+            .create_da_service(
+                rollup_config,
+                require_da_wallet,
+                task_manager.executor(),
+                network,
+            )
             .await?;
         let (l2_block_tx, l2_block_rx) = broadcast::channel(10);
         // If subscriptions disabled, pass None
@@ -124,56 +129,13 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
         })
     }
 
-    /// Creates a new reorging sequencer
-    #[instrument(level = "trace", skip_all)]
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn create_reorg_sequencer(
-        &self,
-        genesis_config: GenesisParams<Self>,
-        sequencer_config: SequencerConfig,
-        da_service: Arc<<Self as RollupBlueprint>::DaService>,
-        ledger_db: LedgerDB,
-        storage_manager: ProverStorageManager,
-        rpc_module: RpcModule<()>,
-        l2_block_tx: broadcast::Sender<u64>,
-        task_executor: TaskExecutor,
-    ) -> Result<(
-        citrea_sequencer::reorg::syncing::CitreaReorgSequencer<Self::DaService, LedgerDB>,
-        RpcModule<()>,
-    )> {
-        let current_l2_height = ledger_db
-            .get_head_l2_block()
-            .map_err(|e| anyhow!("Failed to get head l2 block: {}", e))?
-            .map(|(l2_height, _)| l2_height)
-            .unwrap_or(L2BlockNumber(0));
-
-        let mut fork_manager = ForkManager::new(get_forks(), current_l2_height.0);
-        fork_manager.register_handler(Box::new(ledger_db.clone()));
-
-        let native_stf = StfBlueprint::new();
-        let init_params =
-            self.init_chain(genesis_config, &native_stf, &ledger_db, &storage_manager)?;
-
-        citrea_sequencer::reorg::build_reorg_services(
-            sequencer_config,
-            init_params,
-            native_stf,
-            da_service,
-            ledger_db,
-            storage_manager,
-            rpc_module,
-            l2_block_tx,
-            task_executor,
-        )
-    }
-
     /// In case of an interrupt between l2 block commits of StateDB and LedgerDB,
     /// this function rollbacks dbs to the LedgerDB version.
     async fn sync_ledger_and_state_db(
         &self,
         ledger_db: &LedgerDB,
         storage_manager: &ProverStorageManager,
-        node_type: StorageNodeType,
+        node_type: NodeType,
     ) -> Result<()> {
         let next_version = StateDB::new(storage_manager.get_state_db_handle()).next_version();
         let state_version = if next_version >= 2 {
@@ -210,10 +172,9 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
             rollback
                 .execute(
                     node_type,
-                    ledger_version,
-                    ledger_version, // rollback to ledger version
-                    l1_target,
-                    last_sequencer_commitment_index,
+                    Some(ledger_version), // rollback to ledger version
+                    Some(l1_target),
+                    Some(last_sequencer_commitment_index),
                 )
                 .await?;
         } else if state_version == ledger_version {
@@ -246,7 +207,7 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
         rpc_module: RpcModule<()>,
         backup_manager: Arc<BackupManager>,
         task_executor: TaskExecutor,
-    ) -> Result<(CitreaSequencer<Self::DaService, LedgerDB>, RpcModule<()>)> {
+    ) -> Result<(CitreaSequencer<Self::DaService>, RpcModule<()>)> {
         let current_l2_height = ledger_db
             .get_head_l2_block()
             .map_err(|e| anyhow!("Failed to get head l2 block: {}", e))?
@@ -281,6 +242,7 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
     #[allow(clippy::too_many_arguments)]
     async fn create_full_node(
         &self,
+        network: Network,
         genesis_config: GenesisParams<Self>,
         rollup_config: FullNodeConfig<Self::DaConfig>,
         da_service: Arc<<Self as RollupBlueprint>::DaService>,
@@ -299,7 +261,7 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
 
         let native_stf = StfBlueprint::new();
 
-        self.sync_ledger_and_state_db(&ledger_db, &storage_manager, StorageNodeType::FullNode)
+        self.sync_ledger_and_state_db(&ledger_db, &storage_manager, NodeType::FullNode)
             .await?;
         let init_params =
             self.init_chain(genesis_config, &native_stf, &ledger_db, &storage_manager)?;
@@ -315,6 +277,7 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
         let code_commitments = self.get_batch_proof_code_commitments();
 
         citrea_fullnode::build_services(
+            network,
             runner_config,
             init_params,
             native_stf,
@@ -335,6 +298,7 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     async fn create_batch_prover(
         &self,
+        network: Network,
         prover_config: BatchProverConfig,
         genesis_config: GenesisParams<Self>,
         rollup_config: FullNodeConfig<Self::DaConfig>,
@@ -354,7 +318,7 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
 
         let native_stf = StfBlueprint::new();
 
-        self.sync_ledger_and_state_db(&ledger_db, &storage_manager, StorageNodeType::BatchProver)
+        self.sync_ledger_and_state_db(&ledger_db, &storage_manager, NodeType::BatchProver)
             .await?;
         let init_params =
             self.init_chain(genesis_config, &native_stf, &ledger_db, &storage_manager)?;
@@ -381,6 +345,7 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
         let elfs = self.get_batch_proof_elfs();
 
         citrea_batch_prover::build_services(
+            network,
             prover_config,
             runner_config,
             init_params,
@@ -407,31 +372,18 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
         &self,
         network: Network,
         prover_config: LightClientProverConfig,
-        rollup_config: FullNodeConfig<Self::DaConfig>,
         da_service: Arc<<Self as RollupBlueprint>::DaService>,
         ledger_db: LedgerDB,
         storage_manager: ProverStorageManager,
         rpc_module: RpcModule<()>,
         backup_manager: Arc<BackupManager>,
     ) -> Result<(
-        CitreaLightClientProver,
         LightClientProverL1BlockHandler<Self::Vm, Self::DaService, LedgerDB>,
         RpcModule<()>,
     )>
     where
         Network: InitialValueProvider<Self::DaSpec>,
     {
-        let runner_config = rollup_config.runner.expect("Runner config is missing");
-
-        let current_l2_height = ledger_db
-            .get_head_l2_block()
-            .map_err(|e| anyhow!("Failed to get head l2 block: {}", e))?
-            .map(|(l2_height, _)| l2_height)
-            .unwrap_or(L2BlockNumber(0));
-
-        let mut fork_manager = ForkManager::new(get_forks(), current_l2_height.0);
-        fork_manager.register_handler(Box::new(ledger_db.clone()));
-
         let prover_service = Arc::new(
             self.create_prover_service(
                 prover_config.proving_mode,
@@ -449,7 +401,6 @@ pub trait CitreaRollupBlueprint: RollupBlueprint {
         citrea_light_client_prover::build_services(
             network,
             prover_config,
-            runner_config,
             storage_manager,
             ledger_db,
             da_service,

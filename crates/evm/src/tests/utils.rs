@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_eips::eip1559::{BaseFeeParams, ETHEREUM_BLOCK_GAS_LIMIT_30M};
 use alloy_primitives::hex_literal::hex;
 use alloy_primitives::{address, Address, Bytes, TxKind, B256, U256};
-use lazy_static::lazy_static;
 use short_header_proof_provider::ShortHeaderProofProvider;
+use sov_db::ledger_db::LedgerDB;
+use sov_db::rocks_db_config::RocksdbConfig;
 use sov_modules_api::default_context::DefaultContext;
 use sov_modules_api::fork::Fork;
 use sov_modules_api::hooks::HookL2BlockInfo;
@@ -22,18 +24,20 @@ use crate::{AccountData, Evm, EvmConfig, RlpEvmTransaction, PRIORITY_FEE_VAULT};
 
 type C = DefaultContext;
 
-lazy_static! {
-    pub(crate) static ref GENESIS_HASH: B256 = B256::from(hex!(
+pub(crate) static GENESIS_HASH: LazyLock<B256> = LazyLock::new(|| {
+    B256::from(hex!(
         "e7f38f9b2acc97d9e25c53e20826892a1fa7bd89ee81a62d09fef610d8e94003"
-    ));
-    pub(crate) static ref GENESIS_STATE_ROOT: B256 = B256::from(hex!(
+    ))
+});
+pub(crate) static GENESIS_STATE_ROOT: LazyLock<B256> = LazyLock::new(|| {
+    B256::from(hex!(
         "38dbd050384803b66b62644b16203eae29ee831b04c8f45444698049a0803ddb"
-    ));
-}
+    ))
+});
 
 pub(crate) fn get_evm_with_storage(
     config: &EvmConfig,
-) -> (Evm<C>, WorkingSet<ProverStorage>, ProverStorage) {
+) -> (Evm<C>, WorkingSet<ProverStorage>, ProverStorage, LedgerDB) {
     let tmpdir = tempfile::tempdir().unwrap();
     let prover_storage = new_orphan_storage(tmpdir.path()).unwrap();
     let mut working_set = WorkingSet::new(prover_storage.clone());
@@ -44,17 +48,32 @@ pub(crate) fn get_evm_with_storage(
     genesis_state_root.copy_from_slice(GENESIS_STATE_ROOT.as_ref());
 
     evm.finalize_hook(&genesis_state_root, &mut working_set.accessory_state());
-    (evm, working_set, prover_storage)
+
+    let ledger_db =
+        LedgerDB::with_config(&RocksdbConfig::new(tmpdir.as_ref(), None, None)).unwrap();
+    (evm, working_set, prover_storage, ledger_db)
 }
 
-pub(crate) fn get_evm(config: &EvmConfig) -> (Evm<C>, WorkingSet<<C as Spec>::Storage>, SovSpecId) {
+pub(crate) fn get_evm(
+    config: &EvmConfig,
+) -> (
+    Evm<C>,
+    WorkingSet<<C as Spec>::Storage>,
+    SovSpecId,
+    LedgerDB,
+) {
     get_evm_with_spec(config, SovSpecId::Tangerine)
 }
 
 pub(crate) fn get_evm_with_spec(
     config: &EvmConfig,
     spec_id: SovSpecId,
-) -> (Evm<C>, WorkingSet<<C as Spec>::Storage>, SovSpecId) {
+) -> (
+    Evm<C>,
+    WorkingSet<<C as Spec>::Storage>,
+    SovSpecId,
+    LedgerDB,
+) {
     let tmpdir = tempfile::tempdir().unwrap();
     let storage = new_orphan_storage(tmpdir.path()).unwrap();
     let mut working_set = WorkingSet::new(storage.clone());
@@ -85,8 +104,9 @@ pub(crate) fn get_evm_with_spec(
 
     // let mut genesis_state_root = [0u8; 32];
     // genesis_state_root.copy_from_slice(GENESIS_STATE_ROOT.as_ref());
-
-    (evm, working_set, spec_id)
+    let ledger_db =
+        LedgerDB::with_config(&RocksdbConfig::new(tmpdir.as_ref(), None, None)).unwrap();
+    (evm, working_set, spec_id, ledger_db)
 }
 
 pub(crate) fn commit(
@@ -249,7 +269,7 @@ pub(crate) fn get_evm_config_starting_base_fee(
     signer_balance: U256,
     block_gas_limit: Option<u64>,
     starting_base_fee: u64,
-) -> (EvmConfig, TestSigner, Address) {
+) -> (EvmConfig, TestSigner, Address, LedgerDB) {
     let dev_signer: TestSigner = TestSigner::new_random();
 
     let contract_addr = address!("819c5497b157177315e1204f52e588b393771719");
@@ -267,7 +287,10 @@ pub(crate) fn get_evm_config_starting_base_fee(
         coinbase: PRIORITY_FEE_VAULT,
         ..Default::default()
     };
-    (config, dev_signer, contract_addr)
+    let tmpdir = tempfile::tempdir().unwrap();
+    let ledger_db =
+        LedgerDB::with_config(&RocksdbConfig::new(tmpdir.as_ref(), None, None)).unwrap();
+    (config, dev_signer, contract_addr, ledger_db)
 }
 pub(crate) fn get_evm_test_config() -> EvmConfig {
     EvmConfig {
@@ -312,8 +335,8 @@ pub(crate) fn get_evm_test_config() -> EvmConfig {
     }
 }
 
-pub(crate) fn get_fork_fn_only_tangerine() -> impl Fn(u64) -> Fork {
-    |_: u64| Fork::new(SovSpecId::Tangerine, 0)
+pub(crate) fn get_fork_fn_latest() -> impl Fn(u64) -> Fork {
+    |_: u64| Fork::new(SovSpecId::latest(), 0)
 }
 
 /// Read genesis file
@@ -344,7 +367,10 @@ impl ShortHeaderProofProvider for TestingShortHeaderProofProviderService {
         todo!()
     }
 
-    fn take_queried_hashes(&self, _l2_range: std::ops::RangeInclusive<u64>) -> Vec<[u8; 32]> {
+    fn take_queried_hashes(
+        &self,
+        _l2_range: std::ops::RangeInclusive<u64>,
+    ) -> Result<Vec<[u8; 32]>, short_header_proof_provider::ShortHeaderProofProviderError> {
         todo!()
     }
 

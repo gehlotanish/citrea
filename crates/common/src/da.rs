@@ -1,15 +1,14 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::anyhow;
 use backoff::future::retry as retry_backoff;
 use backoff::ExponentialBackoffBuilder;
-use metrics::Histogram;
 use sov_rollup_interface::da::{BlockHeaderTrait, SequencerCommitment};
 use sov_rollup_interface::services::da::{DaService, SlotData};
 use sov_rollup_interface::zk::Proof;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::sleep;
 use tracing::{debug, error, info};
 
@@ -25,13 +24,11 @@ pub async fn sync_l1<Da>(
     da_service: Arc<Da>,
     block_queue: Arc<Mutex<VecDeque<Da::FilteredBlock>>>,
     l1_block_cache: Arc<Mutex<L1BlockCache<Da>>>,
-    l1_block_scan_histogram: Histogram,
+    notifier: Arc<Notify>,
 ) where
     Da: DaService,
 {
     info!("Starting to sync from L1 height {}", start_from);
-
-    let start = Instant::now();
 
     loop {
         let last_finalized_l1_block_header =
@@ -63,6 +60,7 @@ pub async fn sync_l1<Da>(
 
             let mut queue = block_queue.lock().await;
 
+            notifier.notify_one();
             if queue.len() < 10 {
                 queue.push_back(l1_block);
             } else {
@@ -71,14 +69,6 @@ pub async fn sync_l1<Da>(
             }
 
             start_from = block_number + 1;
-
-            // If the send above does not succeed, we don't set new values
-            // nor do we record any metrics.
-            l1_block_scan_histogram.record(
-                Instant::now()
-                    .saturating_duration_since(start)
-                    .as_secs_f64(),
-            );
         }
 
         sleep(Duration::from_secs(2)).await;
@@ -114,6 +104,7 @@ pub async fn get_da_block_at_height<Da: DaService>(
     Ok(l1_block)
 }
 
+/// Extract SequencerCommitment's from L1 block ordered by their seqcom.index.
 pub fn extract_sequencer_commitments<Da>(
     da_service: Arc<Da>,
     l1_block: &Da::FilteredBlock,
@@ -130,26 +121,13 @@ where
         .collect();
 
     // Make sure all sequencer commitments are stored in ascending order.
-    // We sort before checking ranges to prevent substraction errors.
+    // We sort before checking ranges to prevent subtraction errors.
     sequencer_commitments.sort();
 
     sequencer_commitments
 }
 
-pub async fn extract_zk_proofs<Da: DaService>(
-    da_service: Arc<Da>,
-    l1_block: &Da::FilteredBlock,
-    prover_da_pub_key: &[u8],
-) -> Vec<Proof> {
-    da_service
-        .extract_relevant_zk_proofs(l1_block, prover_da_pub_key)
-        .await
-        .into_iter()
-        .map(|(_, proof)| proof)
-        .collect()
-}
-
-// Extract proofs and commitments and return them sorted by tx index
+/// Extract proofs and commitments and return them sorted by tx index
 pub async fn extract_zk_proofs_and_sequencer_commitments<Da: DaService>(
     da_service: Arc<Da>,
     l1_block: &Da::FilteredBlock,

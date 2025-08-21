@@ -2,9 +2,10 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use risc0_zkvm::guest::env;
 use risc0_zkvm::guest::env::Write;
+use risc0_zkvm::{Digest, VerifierContext};
 use sov_rollup_interface::zk::{Zkvm, ZkvmGuest};
 
-use crate::{receipt_from_proof, Risc0MethodId};
+use crate::receipt_from_proof;
 
 /// A guest for the RISC0 VM. Implements the `ZkvmGuest` trait
 ///  in terms of Risc0's env::read and env::commit functions.
@@ -34,13 +35,13 @@ impl ZkvmGuest for Risc0Guest {
     }
 
     fn verify_with_assumptions(journal: &[u8], code_commitment: &Self::CodeCommitment) {
-        env::verify(code_commitment.0, journal)
+        env::verify(*code_commitment, journal)
             .expect("Assumption API verify error should be infallible")
     }
 }
 
 impl Zkvm for Risc0Guest {
-    type CodeCommitment = Risc0MethodId;
+    type CodeCommitment = Digest;
 
     type Error = Risc0GuestError;
 
@@ -52,13 +53,16 @@ impl Zkvm for Risc0Guest {
     fn verify(
         serialized_proof: &[u8],
         code_commitment: &Self::CodeCommitment,
+        allow_dev_mode: bool,
     ) -> Result<(), Self::Error> {
         let receipt = receipt_from_proof(serialized_proof)
             .map_err(|_| Risc0GuestError::FailedToDeserialize)?;
 
-        #[allow(clippy::clone_on_copy)]
         receipt
-            .verify(code_commitment.0)
+            .verify_with_context(
+                &VerifierContext::default().with_dev_mode(allow_dev_mode),
+                *code_commitment,
+            )
             .map_err(|_| Risc0GuestError::ProofVerificationFailed)
     }
 
@@ -75,13 +79,16 @@ impl Zkvm for Risc0Guest {
     fn verify_and_deserialize_output<T: BorshDeserialize>(
         serialized_proof: &[u8],
         code_commitment: &Self::CodeCommitment,
+        allow_dev_mode: bool,
     ) -> Result<T, Self::Error> {
         let receipt = receipt_from_proof(serialized_proof)
             .map_err(|_| Risc0GuestError::FailedToDeserialize)?;
 
-        #[allow(clippy::clone_on_copy)]
         receipt
-            .verify(code_commitment.0)
+            .verify_with_context(
+                &VerifierContext::default().with_dev_mode(allow_dev_mode),
+                *code_commitment,
+            )
             .map_err(|_| Risc0GuestError::ProofVerificationFailed)?;
 
         T::try_from_slice(&receipt.journal.bytes).map_err(|_| Risc0GuestError::FailedToDeserialize)

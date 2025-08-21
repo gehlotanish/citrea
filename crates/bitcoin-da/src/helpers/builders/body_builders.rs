@@ -1,7 +1,6 @@
+//! This module contains functions to create transactions for the DA layer.
+
 use core::result::Result::Ok;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
 use std::time::Instant;
 
 use bitcoin::blockdata::opcodes::all::{OP_ENDIF, OP_IF};
@@ -12,26 +11,26 @@ use bitcoin::key::{TapTweak, TweakedPublicKey, UntweakedKeypair};
 use bitcoin::opcodes::all::{OP_CHECKSIGVERIFY, OP_NIP};
 use bitcoin::script::PushBytesBuf;
 use bitcoin::secp256k1::{SecretKey, XOnlyPublicKey};
-use bitcoin::{consensus, Address, Amount, Network, Transaction};
-use itertools::Itertools;
+use bitcoin::{Address, Amount, Network, Transaction};
 use metrics::histogram;
 use secp256k1::SECP256K1;
 use serde::Serialize;
 use sov_rollup_interface::da::DataOnDa;
-use tracing::{instrument, trace, warn};
+use tracing::{info, instrument, trace, warn};
 
 use super::{
-    build_commit_transaction, build_reveal_transaction, build_taproot, build_witness,
+    build_commit_transaction, build_control_block, build_reveal_transaction, build_witness,
     get_size_reveal, sign_blob_with_private_key, update_witness, TransactionKind, TxWithId,
 };
 use crate::spec::utxo::UTXO;
 use crate::{REVEAL_OUTPUT_AMOUNT, REVEAL_OUTPUT_THRESHOLD};
 
+/// These are real blobs we put on DA.
 pub(crate) enum RawTxData {
-    /// compress(borsh(DataOnDa::Complete(Proof)))
+    /// borsh(DataOnDa::Complete(compress(Proof)))
     Complete(Vec<u8>),
     /// let compressed = compress(borsh(Proof))
-    /// let chunks = compressed.chunks(MAX_TXBODY_SIZE)
+    /// let chunks = compressed.chunks(MAX_TX_BODY_SIZE)
     /// [borsh(DataOnDa::Chunk(chunk)) for chunk in chunks]
     Chunks(Vec<Vec<u8>>),
     /// borsh(DataOnDa::BatchProofMethodId(MethodId))
@@ -41,105 +40,49 @@ pub(crate) enum RawTxData {
 }
 
 /// This is a list of txs we need to send to DA
-#[derive(Serialize, Clone)]
-pub(crate) enum DaTxs {
+#[derive(Serialize, Clone, Debug)]
+pub enum DaTxs {
+    /// Complete proof.
     Complete {
-        commit: Transaction, // unsigned
+        /// Unsigned
+        commit: Transaction,
+        /// Signed
         reveal: TxWithId,
     },
+    /// Chunked proof.
     Chunked {
-        commit_chunks: Vec<Transaction>, // unsigned
+        /// Unsigned
+        commit_chunks: Vec<Transaction>,
+        /// Signed
         reveal_chunks: Vec<Transaction>,
-        commit: Transaction, // unsigned
+        /// Unsigned
+        commit: Transaction,
+        /// Signed
         reveal: TxWithId,
     },
+    /// BatchProof method id.
     BatchProofMethodId {
-        commit: Transaction, // unsigned
+        /// Unsigned
+        commit: Transaction,
+        /// Signed
         reveal: TxWithId,
     },
+    /// Sequencer commitment.
     SequencerCommitment {
-        commit: Transaction, // unsigned
+        /// Unsigned
+        commit: Transaction,
+        /// Signed
         reveal: TxWithId,
     },
 }
 
-pub(crate) fn backup_complete_txs(
-    mut path: PathBuf,
-    raw_txs: &[Vec<u8>; 2],
-    name: &str,
-) -> Result<(), anyhow::Error> {
-    let commit_tx: Transaction = consensus::deserialize(&raw_txs[0])?;
-    let reveal_tx: Transaction = consensus::deserialize(&raw_txs[1])?;
-
-    path.push(format!(
-        "{}_inscription_commit_id_{}_reveal_id_{}.txs",
-        name,
-        commit_tx.compute_txid(),
-        reveal_tx.compute_txid()
-    ));
-    let file = File::create(path)?;
-    let mut writer: BufWriter<&File> = BufWriter::new(&file);
-
-    writer.write_all(format!("commit {}\n", commit_tx.compute_txid()).as_bytes())?;
-    writer.write_all(hex::encode(raw_txs[0].as_slice()).as_bytes())?;
-    writer.write_all(b"\n")?;
-
-    writer.write_all(format!("reveal {}\n", reveal_tx.compute_txid()).as_bytes())?;
-    writer.write_all(hex::encode(raw_txs[1].as_slice()).as_bytes())?;
-    writer.flush()?;
-
-    Ok(())
-}
-
-pub(crate) fn backup_chunked_txs(
-    mut path: PathBuf,
-    raw_txs: &[Vec<u8>],
-) -> Result<(), anyhow::Error> {
-    let aggr_commit: Transaction = consensus::deserialize(&raw_txs[raw_txs.len() - 2])?;
-    let aggr_reveal: Transaction = consensus::deserialize(&raw_txs[raw_txs.len() - 1])?;
-
-    path.push(format!(
-        "chunked_inscription_commit_id_{}_reveal_id_{}.txs",
-        aggr_commit.compute_txid(),
-        aggr_reveal.compute_txid(),
-    ));
-
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(&file);
-    for (idx, (commit_chunk, reveal_chunk)) in
-        raw_txs[0..raw_txs.len() - 2].iter().tuples().enumerate()
-    {
-        let commit_tx: Transaction = consensus::deserialize(commit_chunk)?;
-        let reveal_tx: Transaction = consensus::deserialize(reveal_chunk)?;
-
-        writer.write_all(
-            format!("chunk {} commit {}\n", idx + 1, commit_tx.compute_txid()).as_bytes(),
-        )?;
-        writer.write_all(hex::encode(commit_chunk).as_bytes())?;
-        writer.write_all(b"\n")?;
-
-        writer.write_all(
-            format!("chunk {} reveal {}\n", idx + 1, reveal_tx.compute_txid()).as_bytes(),
-        )?;
-        writer.write_all(hex::encode(reveal_chunk).as_bytes())?;
-        writer.write_all(b"\n")?;
-    }
-
-    writer.write_all(format!("aggregate commit {}\n", aggr_commit.compute_txid()).as_bytes())?;
-    writer.write_all(hex::encode(raw_txs[raw_txs.len() - 2].as_slice()).as_bytes())?;
-    writer.write_all(b"\n")?;
-
-    writer.write_all(format!("aggregate reveal {}\n", aggr_reveal.compute_txid()).as_bytes())?;
-    writer.write_all(hex::encode(raw_txs[raw_txs.len() - 1].as_slice()).as_bytes())?;
-    writer.flush()?;
-
-    Ok(())
-}
-
-// Creates the light client transactions (commit and reveal)
+/// Creates the light client transactions (commit and reveal).
+/// Based on data type, the number of transactions may vary.
+/// In the end, reveal txs will be mined with a nonce to have
+/// wtxid start from the `reveal_tx_prefix`.
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace", skip_all, err)]
-pub fn create_light_client_transactions(
+pub fn create_inscription_transactions(
     data: RawTxData,
     da_private_key: SecretKey,
     prev_utxo: Option<UTXO>,
@@ -198,7 +141,7 @@ pub fn create_light_client_transactions(
     }
 }
 
-// Creates the inscription transactions Type 0 - Complete
+/// Creates the inscription transactions Type 0 - Complete
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace", skip_all, err)]
 pub fn create_inscription_type_0(
@@ -228,7 +171,7 @@ pub fn create_inscription_type_0(
     let mut reveal_script_builder = script::Builder::new()
         .push_x_only_key(&public_key)
         .push_opcode(OP_CHECKSIGVERIFY)
-        .push_slice(PushBytesBuf::try_from(kind_bytes).expect("Cannot push header"))
+        .push_slice(PushBytesBuf::from(kind_bytes))
         .push_opcode(OP_FALSE)
         .push_opcode(OP_IF)
         .push_slice(PushBytesBuf::try_from(signature).expect("Cannot push signature"))
@@ -254,9 +197,7 @@ pub fn create_inscription_type_0(
                 warn!("Too many iterations finding nonce");
             }
         }
-        let utxos = utxos.clone();
-        let change_address = change_address.clone();
-        // ownerships are moved to the loop
+
         let mut reveal_script_builder = reveal_script_builder.clone();
 
         // push nonce
@@ -269,7 +210,7 @@ pub fn create_inscription_type_0(
         let reveal_script = reveal_script_builder.into_script();
 
         let (control_block, merkle_root, tapscript_hash) =
-            build_taproot(&reveal_script, public_key, SECP256K1);
+            build_control_block(&reveal_script, public_key, SECP256K1);
 
         // create commit tx address
         let commit_tx_address = Address::p2tr(SECP256K1, public_key, merkle_root, network);
@@ -288,20 +229,20 @@ pub fn create_inscription_type_0(
         // we don't need leftover_utxos because they will be requested from bitcoind next call
         let (mut unsigned_commit_tx, _leftover_utxos) = build_commit_transaction(
             prev_utxo.clone(),
-            utxos,
+            utxos.clone(),
             commit_tx_address.clone(),
             change_address.clone(),
             reveal_input_value,
             commit_fee_rate,
         )?;
 
-        let output_to_reveal = unsigned_commit_tx.output[0].clone();
+        let input_to_reveal = unsigned_commit_tx.output[0].clone();
 
         let mut reveal_tx = build_reveal_transaction(
-            output_to_reveal.clone(),
+            input_to_reveal.clone(),
             unsigned_commit_tx.compute_txid(),
             0,
-            change_address,
+            change_address.clone(),
             reveal_value + REVEAL_OUTPUT_THRESHOLD,
             reveal_fee_rate,
             &reveal_script,
@@ -337,12 +278,15 @@ pub fn create_inscription_type_0(
                     commit_tx_address
                 );
 
-                histogram!("mine_da_transaction").record(
+                histogram!("complete_mine_da_transaction").record(
                     Instant::now()
                         .saturating_duration_since(start)
                         .as_secs_f64(),
                 );
 
+                if let Some(root) = merkle_root {
+                    info!("Taproot merkle root for inscription - Complete: {}", root);
+                }
                 return Ok(DaTxs::Complete {
                     commit: unsigned_commit_tx,
                     reveal: TxWithId {
@@ -369,7 +313,7 @@ pub fn create_inscription_type_0(
     }
 }
 
-// Creates the inscription transactions Type 1 - Chunked
+/// Creates the inscription transactions Type 1 - Chunked
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace", skip_all, err)]
 pub fn create_inscription_type_1(
@@ -393,14 +337,14 @@ pub fn create_inscription_type_1(
     let start = Instant::now();
 
     for body in chunks {
-        let kind = TransactionKind::ChunkedPart;
+        let kind = TransactionKind::Chunks;
         let kind_bytes = kind.to_bytes();
 
         // start creating inscription content
         let mut reveal_script_builder = script::Builder::new()
             .push_x_only_key(&public_key)
             .push_opcode(OP_CHECKSIGVERIFY)
-            .push_slice(PushBytesBuf::try_from(kind_bytes).expect("Cannot push header"))
+            .push_slice(PushBytesBuf::from(kind_bytes))
             .push_opcode(OP_FALSE)
             .push_opcode(OP_IF);
         // push body in chunks of 520 bytes
@@ -435,7 +379,7 @@ pub fn create_inscription_type_1(
             let reveal_script = reveal_script_builder.into_script();
 
             let (control_block, merkle_root, tapscript_hash) =
-                build_taproot(&reveal_script, public_key, SECP256K1);
+                build_control_block(&reveal_script, public_key, SECP256K1);
 
             // create commit tx address
             let commit_tx_address = Address::p2tr(SECP256K1, public_key, merkle_root, network);
@@ -537,6 +481,10 @@ pub fn create_inscription_type_1(
                     commit_chunks.push(unsigned_commit_tx);
                     reveal_chunks.push(reveal_tx);
 
+                    if let Some(root) = merkle_root {
+                        info!("Taproot merkle root for inscription - Chunked: {}", root);
+                    }
+
                     break 'mine_chunk;
                 } else {
                     unsigned_commit_tx.output[0].value -= Amount::ONE_SAT;
@@ -567,20 +515,20 @@ pub fn create_inscription_type_1(
 
     let aggregate = DataOnDa::Aggregate(reveal_tx_ids, reveal_wtx_ids);
 
-    // To sign the list of tx ids we assume they form a contigious list of bytes
+    // To sign the list of tx ids we assume they form a contiguous list of bytes
     let reveal_body: Vec<u8> =
         borsh::to_vec(&aggregate).expect("Aggregate serialize must not fail");
     // sign the body for authentication of the sequencer
     let (signature, signer_public_key) = sign_blob_with_private_key(&reveal_body, da_private_key);
 
-    let kind = TransactionKind::Chunked;
+    let kind = TransactionKind::Aggregate;
     let kind_bytes = kind.to_bytes();
 
     // start creating inscription content
     let mut reveal_script_builder = script::Builder::new()
         .push_x_only_key(&public_key)
         .push_opcode(OP_CHECKSIGVERIFY)
-        .push_slice(PushBytesBuf::try_from(kind_bytes).expect("Cannot push header"))
+        .push_slice(PushBytesBuf::from(kind_bytes))
         .push_opcode(OP_FALSE)
         .push_opcode(OP_IF)
         .push_slice(PushBytesBuf::try_from(signature).expect("Cannot push signature"))
@@ -622,7 +570,7 @@ pub fn create_inscription_type_1(
         let reveal_script = reveal_script_builder.into_script();
 
         let (control_block, merkle_root, tapscript_hash) =
-            build_taproot(&reveal_script, public_key, SECP256K1);
+            build_control_block(&reveal_script, public_key, SECP256K1);
 
         // create commit tx address
         let commit_tx_address = Address::p2tr(SECP256K1, public_key, merkle_root, network);
@@ -647,10 +595,10 @@ pub fn create_inscription_type_1(
             commit_fee_rate,
         )?;
 
-        let output_to_reveal = unsigned_commit_tx.output[0].clone();
+        let input_to_reveal = unsigned_commit_tx.output[0].clone();
 
         let mut reveal_tx = build_reveal_transaction(
-            output_to_reveal.clone(),
+            input_to_reveal.clone(),
             unsigned_commit_tx.compute_txid(),
             0,
             change_address,
@@ -690,12 +638,15 @@ pub fn create_inscription_type_1(
                     commit_tx_address
                 );
 
-                histogram!("mine_da_transaction").record(
+                histogram!("chunked_mine_da_transaction").record(
                     Instant::now()
                         .saturating_duration_since(start)
                         .as_secs_f64(),
                 );
 
+                if let Some(root) = merkle_root {
+                    info!("Taproot merkle root for inscription - Aggregate: {}", root);
+                }
                 return Ok(DaTxs::Chunked {
                     commit_chunks,
                     reveal_chunks,
@@ -722,7 +673,7 @@ pub fn create_inscription_type_1(
     }
 }
 
-// Creates the inscription transactions Type 3 - BatchProofMethodId
+/// Creates the inscription transactions Type 3 - BatchProofMethodId
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace", skip_all, err)]
 pub fn create_inscription_type_3(
@@ -752,7 +703,7 @@ pub fn create_inscription_type_3(
     let mut reveal_script_builder = script::Builder::new()
         .push_x_only_key(&public_key)
         .push_opcode(OP_CHECKSIGVERIFY)
-        .push_slice(PushBytesBuf::try_from(kind_bytes).expect("Cannot push header"))
+        .push_slice(PushBytesBuf::from(kind_bytes))
         .push_opcode(OP_FALSE)
         .push_opcode(OP_IF)
         .push_slice(PushBytesBuf::try_from(signature).expect("Cannot push signature"))
@@ -793,7 +744,7 @@ pub fn create_inscription_type_3(
         let reveal_script = reveal_script_builder.into_script();
 
         let (control_block, merkle_root, tapscript_hash) =
-            build_taproot(&reveal_script, public_key, SECP256K1);
+            build_control_block(&reveal_script, public_key, SECP256K1);
 
         // create commit tx address
         let commit_tx_address = Address::p2tr(SECP256K1, public_key, merkle_root, network);
@@ -861,12 +812,18 @@ pub fn create_inscription_type_3(
                     commit_tx_address
                 );
 
-                histogram!("mine_da_transaction").record(
+                histogram!("batch_proof_method_id_mine_da_transaction").record(
                     Instant::now()
                         .saturating_duration_since(start)
                         .as_secs_f64(),
                 );
 
+                if let Some(root) = merkle_root {
+                    info!(
+                        "Taproot merkle root for inscription - BatchProofMethodId: {}",
+                        root
+                    );
+                }
                 return Ok(DaTxs::BatchProofMethodId {
                     commit: unsigned_commit_tx,
                     reveal: TxWithId {
@@ -893,7 +850,7 @@ pub fn create_inscription_type_3(
     }
 }
 
-// Creates the batch proof transactions Type 4 - SequencerCommitment
+/// Creates the batch proof transactions Type 4 - SequencerCommitment
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace", skip_all, err)]
 pub fn create_inscription_type_4(
@@ -927,7 +884,7 @@ pub fn create_inscription_type_4(
     let reveal_script_builder = script::Builder::new()
         .push_x_only_key(&public_key)
         .push_opcode(OP_CHECKSIGVERIFY)
-        .push_slice(PushBytesBuf::try_from(kind_bytes).expect("Cannot push header"))
+        .push_slice(PushBytesBuf::from(kind_bytes))
         .push_opcode(OP_FALSE)
         .push_opcode(OP_IF)
         .push_slice(PushBytesBuf::try_from(signature).expect("Cannot push signature"))
@@ -961,7 +918,7 @@ pub fn create_inscription_type_4(
         let reveal_script = reveal_script_builder.into_script();
 
         let (control_block, merkle_root, tapscript_hash) =
-            build_taproot(&reveal_script, public_key, SECP256K1);
+            build_control_block(&reveal_script, public_key, SECP256K1);
 
         // create commit tx address
         let commit_tx_address = Address::p2tr(SECP256K1, public_key, merkle_root, network);
@@ -1030,12 +987,15 @@ pub fn create_inscription_type_4(
                     commit_tx_address
                 );
 
-                histogram!("mine_da_transaction").record(
+                histogram!("sequencer_commitment_mine_da_transaction").record(
                     Instant::now()
                         .saturating_duration_since(start)
                         .as_secs_f64(),
                 );
 
+                if let Some(root) = merkle_root {
+                    info!("Taproot merkle root for inscription - Commitment: {}", root);
+                }
                 return Ok(DaTxs::SequencerCommitment {
                     commit: unsigned_commit_tx,
                     reveal: TxWithId {

@@ -8,15 +8,14 @@ use borsh::BorshDeserialize;
 use citrea::{CitreaRollupBlueprint, Dependencies, MockDemoRollup, Storage};
 use citrea_common::backup::BackupManager;
 use citrea_common::rpc::server::start_rpc_server;
+use citrea_common::rpc::{register_healthcheck_rpc, register_healthcheck_rpc_light_client_prover};
 use citrea_common::{
-    BatchProverConfig, FullNodeConfig, LightClientProverConfig, RollupPublicKeys, RpcConfig,
-    RunnerConfig, SequencerConfig, StorageConfig,
+    BatchProverConfig, FullNodeConfig, LightClientProverConfig, NodeType, PruningConfig,
+    RollupPublicKeys, RpcConfig, RunnerConfig, SequencerConfig, StorageConfig,
 };
 use citrea_light_client_prover::da_block_handler::StartVariant;
 use citrea_primitives::TEST_PRIVATE_KEY;
 use citrea_stf::genesis_config::GenesisPaths;
-use citrea_storage_ops::pruning::types::StorageNodeType;
-use citrea_storage_ops::pruning::PruningConfig;
 use reth_tasks::TaskManager;
 use short_header_proof_provider::{
     NativeShortHeaderProofProviderService, SHORT_HEADER_PROOF_PROVIDER,
@@ -67,10 +66,6 @@ pub async fn start_rollup(
 ) -> TaskManager {
     // create rollup config default creator function and use them here for the configs
 
-    // We enable risc0 dev mode in tests because the provers in dev mode generate fake receipts that can be verified if the verifier is also in dev mode
-    // Fake receipts are receipts without the proof, they only include the journal, which makes them suitable for testing and development
-    std::env::set_var("RISC0_DEV_MODE", "1");
-
     let mock_demo_rollup = MockDemoRollup::new(network.unwrap_or(Network::Nightly));
 
     if sequencer_config.is_some() && rollup_prover_config.is_some() {
@@ -83,15 +78,14 @@ pub async fn start_rollup(
         panic!("Both batch prover and light client prover config cannot be set at the same time");
     }
 
-    let backup_manager = Arc::new(BackupManager::new("test".to_string(), None, None));
-
-    let (tables, migrations) = if sequencer_config.is_some() {
+    let (tables, migrations, backup_manager) = if sequencer_config.is_some() {
         (
             SEQUENCER_LEDGER_TABLES
                 .iter()
                 .map(|table| table.to_string())
                 .collect::<Vec<_>>(),
             citrea_sequencer::db_migrations::migrations(),
+            Arc::new(BackupManager::new(NodeType::Sequencer, None, None)),
         )
     } else if rollup_prover_config.is_some() {
         (
@@ -100,6 +94,7 @@ pub async fn start_rollup(
                 .map(|table| table.to_string())
                 .collect::<Vec<_>>(),
             citrea_batch_prover::db_migrations::migrations(),
+            Arc::new(BackupManager::new(NodeType::BatchProver, None, None)),
         )
     } else if light_client_prover_config.is_some() {
         (
@@ -108,6 +103,7 @@ pub async fn start_rollup(
                 .map(|table| table.to_string())
                 .collect::<Vec<_>>(),
             citrea_light_client_prover::db_migrations::migrations(),
+            Arc::new(BackupManager::new(NodeType::LightClientProver, None, None)),
         )
     } else {
         (
@@ -116,6 +112,7 @@ pub async fn start_rollup(
                 .map(|table| table.to_string())
                 .collect::<Vec<_>>(),
             citrea_fullnode::db_migrations::migrations(),
+            Arc::new(BackupManager::new(NodeType::FullNode, None, None)),
         )
     };
     mock_demo_rollup
@@ -147,6 +144,7 @@ pub async fn start_rollup(
         .setup_dependencies(
             &rollup_config,
             sequencer_config.is_some() || rollup_prover_config.is_some(),
+            network.unwrap_or(Network::Nightly),
         )
         .await
         .expect("Dependencies setup should work");
@@ -196,17 +194,33 @@ pub async fn start_rollup(
     };
 
     let rpc_storage = storage_manager.create_final_view_storage();
-    let rpc_module = mock_demo_rollup
+    let mut rpc_module = mock_demo_rollup
         .create_rpc_methods(
-            rpc_storage,
+            rpc_storage.clone(),
             &ledger_db,
             &da_service,
-            sequencer_client_url,
-            l2_block_rx,
             &backup_manager,
             rollup_config.rpc.clone(),
         )
         .expect("RPC module setup should work");
+
+    if light_client_prover_config.is_some() {
+        register_healthcheck_rpc_light_client_prover(&mut rpc_module, da_service.clone())
+            .expect("Failed to register healthcheck RPC for light client prover");
+    } else {
+        // Register Ethereum RPC methods if this is not the Light Client Prover
+        citrea::register_ethereum(
+            da_service.clone(),
+            rpc_storage,
+            ledger_db.clone(),
+            &mut rpc_module,
+            sequencer_client_url,
+            l2_block_rx,
+        )
+        .expect("Failed to register Ethereum RPC methods");
+        register_healthcheck_rpc(&mut rpc_module, ledger_db.clone())
+            .expect("Failed to register healthcheck RPC");
+    }
 
     if let Some(sequencer_config) = sequencer_config {
         warn!(
@@ -255,6 +269,7 @@ pub async fn start_rollup(
         let (l2_syncer, l1_syncer, prover, rpc_module) =
             CitreaRollupBlueprint::create_batch_prover(
                 &mock_demo_rollup,
+                network.unwrap_or(Network::Nightly),
                 rollup_prover_config,
                 genesis_config,
                 rollup_config.clone(),
@@ -309,21 +324,19 @@ pub async fn start_rollup(
             None => StartVariant::FromBlock(light_client_prover_config.initial_da_height),
         };
 
-        let (mut rollup, l1_block_handler, rpc_module) =
-            CitreaRollupBlueprint::create_light_client_prover(
-                &mock_demo_rollup,
-                network.expect("should be some"),
-                light_client_prover_config,
-                rollup_config.clone(),
-                da_service,
-                ledger_db,
-                storage_manager,
-                rpc_module,
-                backup_manager,
-            )
-            .instrument(span.clone())
-            .await
-            .unwrap();
+        let (l1_block_handler, rpc_module) = CitreaRollupBlueprint::create_light_client_prover(
+            &mock_demo_rollup,
+            network.expect("should be some"),
+            light_client_prover_config,
+            da_service,
+            ledger_db,
+            storage_manager,
+            rpc_module,
+            backup_manager,
+        )
+        .instrument(span.clone())
+        .await
+        .unwrap();
 
         start_rpc_server(
             rollup_config.rpc.clone(),
@@ -342,16 +355,13 @@ pub async fn start_rollup(
                     .await
             },
         );
-
-        task_executor.spawn_with_graceful_shutdown_signal(|shutdown_signal| async move {
-            rollup.run(shutdown_signal).instrument(span).await.unwrap();
-        });
     } else {
         let span = info_span!("FullNode");
 
         let (mut l2_syncer, l1_block_handler, pruner, rpc_module) =
             CitreaRollupBlueprint::create_full_node(
                 &mock_demo_rollup,
+                network.unwrap_or(Network::Nightly),
                 genesis_config,
                 rollup_config.clone(),
                 da_service,
@@ -386,7 +396,7 @@ pub async fn start_rollup(
         // Spawn pruner if configs are set
         if let Some(pruner) = pruner {
             task_executor.spawn_with_graceful_shutdown_signal(|shutdown_signal| async move {
-                pruner.run(StorageNodeType::FullNode, shutdown_signal).await
+                pruner.run(NodeType::FullNode, shutdown_signal).await
             });
         }
 
@@ -541,7 +551,7 @@ pub async fn wait_for_prover_l1_height_proofs(
     loop {
         debug!("Waiting for prover batch proofs at height {}", num);
         let proofs = prover_client
-            .ledger_get_batch_proofs_by_slot_height(num)
+            .ledger_get_verified_batch_proofs_by_slot_height(num)
             .await;
         if proofs.is_some() {
             break;
@@ -602,8 +612,9 @@ pub async fn wait_for_prover_job_count(
             );
         }
 
-        let job_ids = prover_client.get_proving_jobs(count).await;
-        if job_ids.len() >= count {
+        let jobs = prover_client.get_proving_jobs(count).await;
+        if jobs.len() >= count {
+            let job_ids = jobs.into_iter().map(|j| j.job_id).collect();
             return Ok(job_ids);
         }
 

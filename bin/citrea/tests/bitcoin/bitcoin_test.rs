@@ -2,13 +2,13 @@ use std::time::Duration;
 
 use anyhow::bail;
 use async_trait::async_trait;
+use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Txid};
 use bitcoin_da::monitoring::TxStatus;
 use bitcoin_da::rpc::DaRpcClient;
-use bitcoin_da::service::FINALITY_DEPTH;
 use bitcoincore_rpc::{Client, RpcApi};
 use citrea_batch_prover::rpc::BatchProverRpcClient;
-use citrea_e2e::bitcoin::BitcoinNode;
+use citrea_e2e::bitcoin::{BitcoinNode, DEFAULT_FINALITY_DEPTH};
 use citrea_e2e::config::{BitcoinConfig, TestCaseConfig};
 use citrea_e2e::framework::TestFramework;
 use citrea_e2e::test_case::{TestCase, TestCaseRunner};
@@ -78,7 +78,7 @@ impl TestCase for BitcoinReorgTest {
         f.bitcoin_nodes.connect_nodes().await?;
         f.bitcoin_nodes.wait_for_sync(None).await?;
 
-        // Assert that re-org occured
+        // Assert that re-org occurred
         let new_hash = da0.get_block_hash(original_chain_height).await?;
         assert_ne!(original_chain_hash, new_hash, "Re-org did not occur");
 
@@ -99,7 +99,7 @@ impl TestCase for BitcoinReorgTest {
             .http_client()
             .da_get_tx_status(mempool0[0])
             .await?;
-        assert!(matches!(tx_status, Some(TxStatus::Pending { .. })));
+        assert!(matches!(tx_status, Some(TxStatus::InMempool { .. })));
 
         // Wait for re-org monitoring
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -114,7 +114,7 @@ impl TestCase for BitcoinReorgTest {
         let block = da0.get_block(&hash).await?;
         assert_eq!(block.txdata.len(), 3); // Coinbase + seq commit/reveal txs
 
-        da1.generate(FINALITY_DEPTH - 1).await?;
+        da1.generate(DEFAULT_FINALITY_DEPTH - 1).await?;
         let finalized_height = da1.get_finalized_height(None).await?;
 
         batch_prover
@@ -181,7 +181,21 @@ impl TestCase for DaMonitoringTest {
             .http_client()
             .da_get_tx_status(mempool0[0])
             .await?;
-        assert!(matches!(tx_status, Some(TxStatus::Pending { .. })));
+        assert!(matches!(tx_status, Some(TxStatus::InMempool { .. })));
+
+        let monitored_tx = sequencer
+            .client
+            .http_client()
+            .da_get_monitored_transaction(pending_txs[0].txid, false)
+            .await?;
+        assert_eq!(pending_txs[0], monitored_tx.unwrap());
+
+        let non_monitored_tx = sequencer
+            .client
+            .http_client()
+            .da_get_monitored_transaction(Txid::all_zeros(), false)
+            .await?;
+        assert!(non_monitored_tx.is_none());
 
         da.generate(1).await?;
 
@@ -193,7 +207,7 @@ impl TestCase for DaMonitoringTest {
             .await?;
         assert!(matches!(tx_status, Some(TxStatus::Confirmed { .. })));
 
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
 
         sleep(Duration::from_secs(1)).await;
         let tx_status = sequencer
@@ -320,7 +334,7 @@ impl TestCase for CpfpFeeBumpingTest {
             &[reveal_tx.prev_txid.unwrap(), *parent_txid, cpfp_txid]
         );
 
-        da.generate(FINALITY_DEPTH - 1).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH - 1).await?;
         let finalized_height = da.get_finalized_height(None).await?;
 
         batch_prover
@@ -439,7 +453,7 @@ impl CpfpFeeBumpingTest {
         let cpfp_entry = da.get_mempool_entry(cpfp_txid).await?;
         let cpfp_fee_rate = cpfp_entry.fees.base.to_sat() as f64 / cpfp_entry.vsize as f64;
 
-        // Verify the child tx has higher fee rate to accomodate for child + parent
+        // Verify the child tx has higher fee rate to accommodate for child + parent
         assert!(cpfp_fee_rate >= target_fee_rate);
 
         // Verify that child spends from reveal tx and keeps a correct tx chain

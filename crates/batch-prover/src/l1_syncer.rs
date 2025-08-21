@@ -1,5 +1,11 @@
+//! Data Availability (DA) block handling for the batch prover
+//!
+//! This module is responsible for processing L1 blocks, extracting and storing
+//! sequencer commitments and signaling prover module after successful L1 block processing.
+
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 use citrea_common::backup::BackupManager;
 use citrea_common::cache::L1BlockCache;
@@ -13,24 +19,39 @@ use sov_rollup_interface::da::BlockHeaderTrait;
 use sov_rollup_interface::services::da::{DaService, SlotData};
 use tokio::select;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::Duration;
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, Mutex, Notify};
+use tracing::{error, info, instrument, warn};
 
-use crate::metrics::BATCH_PROVER_METRICS;
+use crate::metrics::BATCH_PROVER_METRICS as BPM;
 
+/// Handles L1 sync operations by tracking the finalized L1 blocks and
+/// extracting the sequencer commitments from them.
+///
+/// This struct is responsible for:
+/// - Synchronizing L1 blocks
+/// - Processing sequencer commitments
+/// - Maintaining block processing order
+/// - Managing the backup state
 pub struct L1Syncer<Da, DB>
 where
     Da: DaService,
     DB: BatchProverLedgerOps,
 {
+    /// Database for ledger operations
     ledger_db: DB,
+    /// Data availability service instance
     da_service: Arc<Da>,
+    /// Sequencer's DA public key for verifying commitments
     sequencer_da_pub_key: Vec<u8>,
+    /// The height from which to start scanning L1 blocks
     scan_l1_start_height: u64,
+    /// Cache for L1 blocks to avoid redundant fetches
     l1_block_cache: Arc<Mutex<L1BlockCache<Da>>>,
+    /// Queue of pending L1 blocks to be processed
     pending_l1_blocks: Arc<Mutex<VecDeque<<Da as DaService>::FilteredBlock>>>,
+    /// Manager for backup operations
     backup_manager: Arc<BackupManager>,
+    /// Channel sender to signal prover module when new L1 blocks are processed
     l1_signal_tx: mpsc::Sender<()>,
 }
 
@@ -39,6 +60,16 @@ where
     Da: DaService,
     DB: BatchProverLedgerOps + Clone + 'static,
 {
+    /// Creates a new instance of `L1Syncer`
+    ///
+    /// # Arguments
+    /// * `ledger_db` - The database instance to store L1 block data.
+    /// * `da_service` - The DA service instance to fetch L1 blocks.
+    /// * `public_keys` - The public keys used for distinguishing between different rollup participants.
+    /// * `scan_l1_start_height` - The height from which to start scanning L1 blocks.
+    /// * `l1_block_cache` - A cache for L1 blocks to avoid redundant fetches.
+    /// * `backup_manager` - Manager for backup operations.
+    /// * `l1_signal_tx` - A channel sender to signal prover module when new L1 blocks are processed.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ledger_db: DB,
@@ -61,6 +92,14 @@ where
         }
     }
 
+    /// Runs the L1Syncer until shutdown is signaled
+    ///
+    /// This method continuously:
+    /// 1. Fetches new L1 blocks from the DA Layer
+    /// 2. Processes each block to update the local state
+    /// 3. Handles any errors with exponential backoff
+    /// 4. Maintains metrics about syncing progress
+    #[instrument(name = "L1Syncer", skip_all)]
     pub async fn run(mut self, mut shutdown_signal: GracefulShutdown) {
         let l1_start_height = self
             .ledger_db
@@ -69,18 +108,17 @@ where
             .map(|h| h.0)
             .unwrap_or(self.scan_l1_start_height);
 
+        let notifier = Arc::new(Notify::new());
         let l1_sync_worker = sync_l1(
             l1_start_height,
             self.da_service.clone(),
             self.pending_l1_blocks.clone(),
             self.l1_block_cache.clone(),
-            BATCH_PROVER_METRICS.scan_l1_block.clone(),
+            notifier.clone(),
         );
         tokio::pin!(l1_sync_worker);
 
         let backup_manager = self.backup_manager.clone();
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.tick().await;
         loop {
             select! {
                 biased;
@@ -88,7 +126,7 @@ where
                     info!("Shutting down L1 syncer");
                     return;
                 }
-                _ = interval.tick() => {
+                _ = notifier.notified() => {
                     let _l1_guard = backup_manager.start_l1_processing().await;
                     if let Err(e) = self.process_l1_blocks().await {
                         error!("Could not process L1 blocks: {:?}", e);
@@ -99,15 +137,25 @@ where
         }
     }
 
+    /// Processes L1 blocks waiting in the queue
+    ///
+    /// This method for each L1 block in the queue:
+    /// 1. Records block height to hash mapping
+    /// 2. Saves the block's short header proof
+    /// 3. Extracts sequencer commitments and stores them by index
+    /// 4. Updates the last scanned L1 height in the database after each successfully processed block
+    /// 5. If queue is not empty, After processing each block in the queue , pings the L1 signal channel.
     async fn process_l1_blocks(&mut self) -> Result<(), anyhow::Error> {
         let mut pending_l1_blocks = self.pending_l1_blocks.lock().await;
         // don't ping if no new l1 blocks
         let should_ping = pending_l1_blocks.len() > 0;
 
+        // process all the pending l1 blocks
         while !pending_l1_blocks.is_empty() {
             let l1_block = pending_l1_blocks
                 .front()
                 .expect("Pending l1 blocks cannot be empty");
+            let start_l1_block_processing = Instant::now();
             let l1_height = l1_block.header().height();
             let l1_hash = l1_block.header().hash().into();
 
@@ -174,7 +222,12 @@ where
                 .set_last_scanned_l1_height(SlotNumber(l1_height))
                 .expect("Should put prover last scanned l1 height");
 
-            BATCH_PROVER_METRICS.current_l1_block.set(l1_height as f64);
+            BPM.current_l1_block.set(l1_height as f64);
+            BPM.set_scan_l1_block_duration(
+                Instant::now()
+                    .saturating_duration_since(start_l1_block_processing)
+                    .as_secs_f64(),
+            );
 
             pending_l1_blocks.pop_front();
 

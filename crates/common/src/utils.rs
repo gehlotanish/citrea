@@ -8,12 +8,10 @@ use anyhow::{anyhow, Context as _};
 use borsh::BorshDeserialize;
 use citrea_evm::system_contracts::{BitcoinLightClientContract, BridgeContract};
 use citrea_evm::{CallMessage as EvmCallMessage, SYSTEM_SIGNER};
-use citrea_primitives::EMPTY_TX_ROOT;
+use citrea_primitives::forks::get_forks;
 use reth_primitives::{Recovered, TransactionSigned};
-use rs_merkle::algorithms::Sha256;
-use rs_merkle::MerkleTree;
 use sov_db::ledger_db::SharedLedgerOps;
-use sov_modules_api::{Context, DaSpec, Spec};
+use sov_modules_api::DaSpec;
 use sov_rollup_interface::rpc::block::L2BlockResponse;
 use sov_rollup_interface::services::da::DaService;
 use sov_rollup_interface::spec::SpecId;
@@ -36,22 +34,6 @@ pub fn check_l2_block_exists<DB: SharedLedgerOps>(ledger_db: &DB, l2_height: u64
     };
 
     head_l2_height >= l2_height
-}
-
-pub fn compute_tx_hashes<C: Context>(txs: &[Transaction], _current_spec: SpecId) -> Vec<[u8; 32]> {
-    txs.iter()
-        .map(|tx| tx.compute_digest::<<C as Spec>::Hasher>().into())
-        .collect()
-}
-
-pub fn compute_tx_merkle_root(tx_hashes: &[[u8; 32]]) -> anyhow::Result<[u8; 32]> {
-    if tx_hashes.is_empty() {
-        return Ok(EMPTY_TX_ROOT);
-    }
-
-    MerkleTree::<Sha256>::from_leaves(tx_hashes)
-        .root()
-        .context("Couldn't compute merkle root")
 }
 
 async fn update_short_header_proof_from_sys_tx<Da: DaService, DB: SharedLedgerOps>(
@@ -104,8 +86,11 @@ async fn update_short_header_proof_from_sys_tx<Da: DaService, DB: SharedLedgerOp
         BridgeContract::depositCall::SELECTOR => {
             tracing::info!("Deposit system tx found inside block");
         }
-        _ => {
-            return Err(anyhow!("Invalid system tx"));
+        // TODO: https://github.com/chainwayxyz/citrea/issues/2442
+        unexpected_selector => {
+            tracing::warn!(
+                "Unexpected function selector at system tx: {unexpected_selector:?} , tx input: {:?}, tx hash: {:?}, tx nonce: {:?}", tx.inner().transaction().input(), tx.inner().hash(), tx.inner().transaction().nonce()
+            );
         }
     }
 
@@ -153,4 +138,29 @@ pub async fn decode_sov_tx_and_update_short_header_proofs<Da: DaService, DB: Sha
 
 pub fn read_env(key: &str) -> anyhow::Result<String> {
     env::var(key).map_err(|_| anyhow::anyhow!("Env {} missing or invalid UTF-8", key))
+}
+
+// If tangerine activation height is 0, return 1
+// Because in tests when the first l2 block for the first sequencer commitment is needed
+// Tangerine activation height should be sent
+// If it is 0, it errors out because l2 block 0 is not valid
+// So for only in tests, if tangerine activation height is 0, return 1
+// In production, it will return whatever the activation height is
+// If network starts from Fork3, use 1 as the activation height
+// as we'd like to behave the same way
+pub fn get_tangerine_activation_height_non_zero() -> u64 {
+    let forks = get_forks();
+
+    if forks[0].spec_id > SpecId::Tangerine {
+        return 1;
+    }
+
+    let fork = forks
+        .iter()
+        .find(|f| f.spec_id == SpecId::Tangerine)
+        .expect("Tangerine should exist");
+    if fork.activation_height == 0 {
+        return 1;
+    }
+    fork.activation_height
 }

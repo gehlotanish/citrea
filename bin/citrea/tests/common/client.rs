@@ -13,11 +13,12 @@ use alloy::serde::WithOtherFields;
 use alloy::signers::local::PrivateKeySigner;
 use alloy_primitives::{Address, Bytes, TxHash, TxKind, B256, U256, U32, U64};
 // use reth_rpc_types::TransactionReceipt;
+use alloy_rpc_types::SyncStatus as EthSyncStatus;
 use alloy_rpc_types::{BlockId, BlockNumberOrTag, EIP1186AccountProofResponse, Filter, Log};
 use alloy_rpc_types_trace::geth::{
     GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace, TraceResult,
 };
-use citrea_batch_prover::rpc::BatchProverRpcClient;
+use citrea_batch_prover::rpc::{BatchProverRpcClient, ProvingJobResponse};
 use citrea_batch_prover::PartitionMode;
 use citrea_evm::EstimatedDiffSize;
 use ethereum_rpc::SyncStatus;
@@ -25,11 +26,12 @@ use jsonrpsee::core::client::{ClientT, SubscriptionClientT};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::{PingConfig, WsClient, WsClientBuilder};
+use sov_db::schema::types::L2HeightAndIndex;
 use sov_ledger_rpc::{HexHash, LedgerRpcClient};
 use sov_rollup_interface::rpc::block::L2BlockResponse;
 use sov_rollup_interface::rpc::{
-    BatchProofResponse, JobRpcResponse, LastVerifiedBatchProofResponse,
-    SequencerCommitmentResponse, SequencerCommitmentRpcParam, VerifiedBatchProofResponse,
+    JobRpcResponse, LastVerifiedBatchProofResponse, SequencerCommitmentResponse,
+    SequencerCommitmentRpcParam, VerifiedBatchProofResponse,
 };
 use uuid::Uuid;
 
@@ -292,7 +294,7 @@ impl TestClient {
             .nonce(nonce)
             .with_authorization_list(authorization_list);
 
-        let gas = self.client.estimate_gas(req.clone()).await.unwrap();
+        let gas = self.client.estimate_gas(req.clone()).await?;
 
         let req = req
             .gas_limit(gas)
@@ -375,7 +377,7 @@ impl TestClient {
         &self,
         address: Address,
         block_id: Option<BlockId>,
-    ) -> Result<Bytes, Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<Bytes> {
         self.http_client
             .request("eth_getCode", rpc_params![address, block_id])
             .await
@@ -593,16 +595,6 @@ impl TestClient {
             .map_err(|e| e.into())
     }
 
-    pub(crate) async fn ledger_get_batch_proofs_by_slot_height(
-        &self,
-        height: u64,
-    ) -> Option<Vec<BatchProofResponse>> {
-        self.http_client
-            .get_batch_proofs_by_slot_height(U64::from(height))
-            .await
-            .unwrap()
-    }
-
     pub(crate) async fn ledger_get_verified_batch_proofs_by_slot_height(
         &self,
         height: u64,
@@ -790,9 +782,30 @@ impl TestClient {
         block_number.saturating_to()
     }
 
+    pub(crate) async fn eth_syncing(&self) -> EthSyncStatus {
+        self.http_client
+            .request("eth_syncing", rpc_params![])
+            .await
+            .unwrap()
+    }
+
     pub(crate) async fn citrea_sync_status(&self) -> SyncStatus {
         self.http_client
             .request("citrea_syncStatus", rpc_params![])
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn get_last_committed_l2_height(&self) -> Option<L2HeightAndIndex> {
+        self.http_client
+            .request("citrea_getLastCommittedL2Height", rpc_params![])
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn get_last_proven_l2_height(&self) -> Option<L2HeightAndIndex> {
+        self.http_client
+            .request("citrea_getLastProvenL2Height", rpc_params![])
             .await
             .unwrap()
     }
@@ -819,7 +832,7 @@ impl TestClient {
         self.http_client.get_proving_job(id).await.unwrap()
     }
 
-    pub(crate) async fn get_proving_jobs(&self, count: usize) -> Vec<Uuid> {
+    pub(crate) async fn get_proving_jobs(&self, count: usize) -> Vec<ProvingJobResponse> {
         self.http_client.get_proving_jobs(count).await.unwrap()
     }
 
@@ -844,6 +857,28 @@ impl TestClient {
         }
 
         Some(commitments)
+    }
+
+    /// Halt sequencer commitments
+    pub(crate) async fn sequencer_halt_commitments(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _: () = self
+            .http_client
+            .request("citrea_haltCommitments", rpc_params![])
+            .await?;
+        Ok(())
+    }
+
+    /// Resume sequencer commitments
+    pub(crate) async fn sequencer_resume_commitments(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _: () = self
+            .http_client
+            .request("citrea_resumeCommitments", rpc_params![])
+            .await?;
+        Ok(())
     }
 }
 

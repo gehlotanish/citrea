@@ -1,3 +1,4 @@
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -27,6 +28,7 @@ use crate::schema::tables::{
 use crate::schema::types::batch_proof::{
     StoredBatchProof, StoredBatchProofOutput, StoredVerifiedProof,
 };
+use crate::schema::types::job_status::JobStatus;
 use crate::schema::types::l2_block::{StoredL2Block, StoredTransaction};
 use crate::schema::types::light_client_proof::{
     StoredLightClientProof, StoredLightClientProofOutput,
@@ -625,7 +627,7 @@ impl BatchProverLedgerOps for LedgerDB {
     }
 
     #[instrument(level = "trace", skip(self), err)]
-    fn get_latest_job_ids(&self, count: usize) -> anyhow::Result<Vec<Uuid>> {
+    fn get_latest_jobs(&self, count: usize) -> anyhow::Result<Vec<(Uuid, JobStatus)>> {
         let mut read_opts = ReadOptions::default();
         // Do not fill the cache with garbage data just to read ids
         read_opts.fill_cache(false);
@@ -635,15 +637,17 @@ impl BatchProverLedgerOps for LedgerDB {
             .iter_with_direction::<CommitmentIndicesByJobId>(read_opts, ScanDirection::Backward)?;
         iter.seek_to_last();
 
-        let mut job_ids = Vec::with_capacity(count);
+        let mut jobs = Vec::with_capacity(count);
         for el in iter {
-            if job_ids.len() == count {
+            if jobs.len() == count {
                 break;
             }
-            job_ids.push(el?.key);
+            let job_id = el?.key;
+            let status = self.job_status(job_id);
+            jobs.push((job_id, status));
         }
 
-        Ok(job_ids)
+        Ok(jobs)
     }
 
     #[instrument(level = "trace", skip(self), err)]
@@ -652,6 +656,19 @@ impl BatchProverLedgerOps for LedgerDB {
         l1_height: SlotNumber,
     ) -> anyhow::Result<Option<Vec<u32>>> {
         self.db.get::<CommitmentIndicesByL1>(&l1_height)
+    }
+
+    #[instrument(level = "trace", skip(self))]
+    fn job_status(&self, id: Uuid) -> JobStatus {
+        if let Some(el) = self.db.get::<ProofByJobId>(&id).unwrap() {
+            if el.l1_tx_id.is_some() {
+                JobStatus::Finished
+            } else {
+                JobStatus::Sending
+            }
+        } else {
+            JobStatus::Proving
+        }
     }
 }
 
@@ -747,13 +764,16 @@ impl SequencerLedgerOps for LedgerDB {
 
     /// Sets the state diff by block number
     #[instrument(level = "trace", skip(self), err, ret)]
-    fn delete_state_diff(&self, l2_height: L2BlockNumber) -> anyhow::Result<()> {
+    fn delete_state_diff_by_range(
+        &self,
+        l2_height_range: RangeInclusive<L2BlockNumber>,
+    ) -> anyhow::Result<()> {
         let mut schema_batch = SchemaBatch::new();
-        schema_batch.delete::<StateDiffByBlockNumber>(&l2_height)?;
+        for l2_height in l2_height_range.start().0..=l2_height_range.end().0 {
+            schema_batch.delete::<StateDiffByBlockNumber>(&L2BlockNumber(l2_height))?;
+        }
 
-        self.db.write_schemas(schema_batch)?;
-
-        Ok(())
+        self.db.write_schemas(schema_batch)
     }
 
     /// Gets the state diff by block number
@@ -870,9 +890,16 @@ impl NodeLedgerOps for LedgerDB {
         Ok(())
     }
 
-    fn store_pending_commitment(&self, commitment: SequencerCommitment) -> anyhow::Result<()> {
+    fn store_pending_commitment(
+        &self,
+        commitment: SequencerCommitment,
+        found_in_l1_height: u64,
+    ) -> anyhow::Result<()> {
         let mut schema_batch = SchemaBatch::new();
-        schema_batch.put::<PendingSequencerCommitments>(&commitment.index, &commitment)?;
+        schema_batch.put::<PendingSequencerCommitments>(
+            &commitment.index,
+            &(commitment.clone(), found_in_l1_height),
+        )?;
         self.db.write_schemas(schema_batch)?;
 
         Ok(())
@@ -881,22 +908,22 @@ impl NodeLedgerOps for LedgerDB {
     fn get_pending_commitment_by_index(
         &self,
         index: u32,
-    ) -> anyhow::Result<Option<SequencerCommitment>> {
+    ) -> anyhow::Result<Option<(SequencerCommitment, u64)>> {
         self.db.get::<PendingSequencerCommitments>(&index)
     }
 
-    fn get_pending_commitments(&self) -> anyhow::Result<Vec<(u32, SequencerCommitment)>> {
+    fn get_pending_commitments(&self) -> anyhow::Result<Vec<(u32, SequencerCommitment, u64)>> {
         let mut pending = Vec::new();
         let mut iter = self.db.iter::<PendingSequencerCommitments>()?;
         iter.seek_to_first();
 
         while let Some(Ok(item)) = iter.next() {
-            let (index, commitment) = item.into_tuple();
-            pending.push((index, commitment));
+            let (index, (commitment, l1_height)) = item.into_tuple();
+            pending.push((index, commitment, l1_height));
         }
 
         // Sort by index to make sure we process pending commitments in order
-        pending.sort_by_key(|(index, _)| *index);
+        pending.sort_by_key(|(index, _, _)| *index);
 
         Ok(pending)
     }
@@ -913,25 +940,29 @@ impl NodeLedgerOps for LedgerDB {
         min_commitment_index: u32,
         max_commitment_index: u32,
         proof: Proof,
+        found_in_l1_height: u64,
     ) -> anyhow::Result<()> {
         let mut schema_batch = SchemaBatch::new();
-        schema_batch.put::<PendingProofs>(&(min_commitment_index, max_commitment_index), &proof)?;
+        schema_batch.put::<PendingProofs>(
+            &(min_commitment_index, max_commitment_index),
+            &(proof, found_in_l1_height),
+        )?;
         self.db.write_schemas(schema_batch)?;
         Ok(())
     }
 
-    fn get_pending_proofs(&self) -> anyhow::Result<Vec<((u32, u32), Proof)>> {
+    fn get_pending_proofs(&self) -> anyhow::Result<Vec<((u32, u32), Proof, u64)>> {
         let mut pending = Vec::new();
         let mut iter = self.db.iter::<PendingProofs>()?;
         iter.seek_to_first();
 
         while let Some(Ok(item)) = iter.next() {
-            let (index_range, proof) = item.into_tuple();
-            pending.push((index_range, proof));
+            let (index_range, (proof, found_in_l1_height)) = item.into_tuple();
+            pending.push((index_range, proof, found_in_l1_height));
         }
 
         // Sort by min commitment index to ensure we process in order
-        pending.sort_by_key(|((min_index, _), _)| *min_index);
+        pending.sort_by_key(|((min_index, _), _, _)| *min_index);
 
         Ok(pending)
     }

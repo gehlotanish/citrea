@@ -13,6 +13,7 @@ resolver = "2"
 
 [dependencies]
 citrea-evm = { path = "../evm" }
+sov-db = { path = "../sovereign-sdk/full-node/db/sov-db", optional = true }
 sov-modules-api = { path = "../sovereign-sdk/module-system/sov-modules-api", default-features = false, features = ["macros"] }
 sov-rollup-interface = { path = "../sovereign-sdk/rollup-interface" }
 sov-state = { path = "../sovereign-sdk/module-system/sov-state" }
@@ -25,7 +26,6 @@ tracing = { workspace = true, optional = true }
 [dev-dependencies]
 chrono = { workspace = true, default-features = true }
 hex = { workspace = true }
-lazy_static = "1.4.0"
 sov-keys = { path = "../sovereign-sdk/module-system/sov-keys" }
 sov-mock-da = { path = "../sovereign-sdk/adapters/mock-da", features = ["native"] }
 sov-modules-api = { path = "../sovereign-sdk/module-system/sov-modules-api", features = ["native", "testing"] }
@@ -35,4 +35,4 @@ tempfile = { workspace = true }
 
 [features]
 default = []
-native = ["sov-modules-api/native", "dep:tracing", "jsonrpsee"]
+native = ["dep:sov-db", "sov-modules-api/native", "dep:tracing", "jsonrpsee"]

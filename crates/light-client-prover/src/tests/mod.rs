@@ -3,8 +3,10 @@ pub mod test_utils;
 use sov_mock_da::{MockAddress, MockBlob, MockBlockHeader, MockDaSpec, MockDaVerifier};
 use sov_mock_zkvm::MockZkGuest;
 use sov_modules_api::WorkingSet;
+use sov_modules_core::StorageValue;
 use sov_rollup_interface::da::{BlobReaderTrait, DataOnDa, SequencerCommitment};
 use sov_rollup_interface::zk::light_client_proof::input::LightClientCircuitInput;
+use sov_rollup_interface::zk::light_client_proof::output::VerifiedStateTransitionForSequencerCommitmentIndex;
 use sov_rollup_interface::Network;
 use sov_state::{ProverStorage, ZkStorage};
 use tempfile::tempdir;
@@ -72,7 +74,7 @@ fn test_light_client_circuit_valid_da_valid_data() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1.clone(),
             inclusion_proof: [1u8; 32],
@@ -136,7 +138,7 @@ fn test_light_client_circuit_valid_da_valid_data() {
 
     let input_2 = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(mock_output_1_serialized),
+            previous_light_client_proof: Some(mock_output_1_serialized),
             da_block_header: block_header_2,
             light_client_proof_method_id,
             inclusion_proof: [1u8; 32],
@@ -221,7 +223,7 @@ fn test_light_client_circuit_commitment_chaining() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1.clone(),
             inclusion_proof: [1u8; 32],
@@ -307,7 +309,7 @@ fn test_previous_commitment_not_set_should_not_transition() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1,
             inclusion_proof: [1u8; 32],
@@ -371,7 +373,7 @@ fn test_batch_proof_with_missing_commitment_not_set_should_not_transition() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1,
             inclusion_proof: [1u8; 32],
@@ -448,7 +450,7 @@ fn test_wrong_order_da_blocks_should_still_work() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1,
             inclusion_proof: [1u8; 32],
@@ -527,7 +529,7 @@ fn create_unchainable_outputs_then_chain_them_on_next_block() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1.clone(),
             inclusion_proof: [1u8; 32],
@@ -612,7 +614,7 @@ fn create_unchainable_outputs_then_chain_them_on_next_block() {
 
     let input_2 = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(mock_output_1_ser),
+            previous_light_client_proof: Some(mock_output_1_ser),
             light_client_proof_method_id,
             da_block_header: block_header_2,
             inclusion_proof: [1u8; 32],
@@ -690,7 +692,7 @@ fn test_header_chain_proof_height_and_hash() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1.clone(),
             inclusion_proof: [1u8; 32],
@@ -755,7 +757,7 @@ fn test_header_chain_proof_height_and_hash() {
 
     let input_2 = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(prev_lcp_out),
+            previous_light_client_proof: Some(prev_lcp_out),
             da_block_header: block_header_2,
             light_client_proof_method_id,
             inclusion_proof: [1u8; 32],
@@ -844,7 +846,7 @@ fn test_unverifiable_batch_proofs() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1,
             inclusion_proof: [1u8; 32],
@@ -892,7 +894,7 @@ fn test_unverifiable_batch_proofs() {
 }
 
 #[test]
-#[should_panic = "Assumption proof verification failed!"]
+#[should_panic = "Previous light client proof is invalid"]
 fn test_unverifiable_prev_light_client_proof() {
     let db_dir = tempdir().unwrap();
     let native_circuit_runner = NativeCircuitRunner::new(db_dir.path().to_path_buf());
@@ -936,7 +938,7 @@ fn test_unverifiable_prev_light_client_proof() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1,
             inclusion_proof: [1u8; 32],
@@ -988,7 +990,7 @@ fn test_unverifiable_prev_light_client_proof() {
 
     let input_2 = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(prev_lcp_out),
+            previous_light_client_proof: Some(prev_lcp_out),
             da_block_header: block_header_2,
             light_client_proof_method_id,
             inclusion_proof: [1u8; 32],
@@ -1050,7 +1052,7 @@ fn test_new_method_id_txs() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1,
             inclusion_proof: [1u8; 32],
@@ -1097,7 +1099,7 @@ fn test_new_method_id_txs() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(create_prev_lcp_serialized(output_1, true)),
+            previous_light_client_proof: Some(create_prev_lcp_serialized(output_1, true)),
             light_client_proof_method_id,
             da_block_header: block_header_2,
             inclusion_proof: [1u8; 32],
@@ -1134,7 +1136,7 @@ fn test_new_method_id_txs() {
         vec![(0u64, [0u32; 8]), (10u64, [2u32; 8])]
     );
 
-    // now try activation height < last activationg height and activation height = last activation height
+    // now try activation height < last activating height and activation height = last activation height
     let blob_1 = create_new_method_id_tx(10, [2u32; 8], method_id_upgrade_authority);
     let blob_2 = create_new_method_id_tx(3, [2u32; 8], method_id_upgrade_authority);
 
@@ -1142,7 +1144,7 @@ fn test_new_method_id_txs() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(create_prev_lcp_serialized(output_2, true)),
+            previous_light_client_proof: Some(create_prev_lcp_serialized(output_2, true)),
             light_client_proof_method_id,
             da_block_header: block_header_3,
             inclusion_proof: [1u8; 32],
@@ -1229,7 +1231,7 @@ fn test_unverifiable_batch_proof_is_ignored() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1,
             inclusion_proof: [1u8; 32],
@@ -1304,7 +1306,7 @@ fn test_light_client_circuit_verify_chunks() {
         chunk1_serialized.clone(),
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([1; 32]),
+        [1; 32],
     );
     blob1.full_data();
 
@@ -1316,7 +1318,7 @@ fn test_light_client_circuit_verify_chunks() {
         chunk2_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([2; 32]),
+        [2; 32],
     );
 
     blob2.full_data();
@@ -1329,21 +1331,13 @@ fn test_light_client_circuit_verify_chunks() {
         chunk3_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([3; 32]),
+        [3; 32],
     );
     blob3.full_data();
 
     let aggregate_da_data = DataOnDa::Aggregate(
-        vec![
-            blob1.wtxid().unwrap(),
-            blob2.wtxid().unwrap(),
-            blob3.wtxid().unwrap(),
-        ],
-        vec![
-            blob1.wtxid().unwrap(),
-            blob2.wtxid().unwrap(),
-            blob3.wtxid().unwrap(),
-        ],
+        vec![blob1.wtxid(), blob2.wtxid(), blob3.wtxid()],
+        vec![blob1.wtxid(), blob2.wtxid(), blob3.wtxid()],
     );
 
     let aggregate_serialized = borsh::to_vec(&aggregate_da_data).expect("should serialize");
@@ -1352,13 +1346,13 @@ fn test_light_client_circuit_verify_chunks() {
         aggregate_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([4; 32]),
+        [4; 32],
     );
     blob4.full_data();
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1,
             inclusion_proof: [1u8; 32],
@@ -1436,7 +1430,7 @@ fn test_missing_chunk() {
         chunk1_serialized.clone(),
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([1; 32]),
+        [1; 32],
     );
     blob1.full_data();
 
@@ -1448,7 +1442,7 @@ fn test_missing_chunk() {
         chunk2_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([2; 32]),
+        [2; 32],
     );
 
     blob2.full_data();
@@ -1461,21 +1455,13 @@ fn test_missing_chunk() {
         chunk3_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([3; 32]),
+        [3; 32],
     );
     blob3.full_data();
 
     let aggregate_da_data = DataOnDa::Aggregate(
-        vec![
-            blob1.wtxid().unwrap(),
-            blob2.wtxid().unwrap(),
-            blob3.wtxid().unwrap(),
-        ],
-        vec![
-            blob1.wtxid().unwrap(),
-            blob2.wtxid().unwrap(),
-            blob3.wtxid().unwrap(),
-        ],
+        vec![blob1.wtxid(), blob2.wtxid(), blob3.wtxid()],
+        vec![blob1.wtxid(), blob2.wtxid(), blob3.wtxid()],
     );
 
     let aggregate_serialized = borsh::to_vec(&aggregate_da_data).expect("should serialize");
@@ -1484,13 +1470,13 @@ fn test_missing_chunk() {
         aggregate_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([4; 32]),
+        [4; 32],
     );
     blob4.full_data();
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1,
             // Blob2 is not present
@@ -1564,7 +1550,7 @@ fn test_malicious_aggregate_should_not_work() {
         chunk1_serialized.clone(),
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([1; 32]),
+        [1; 32],
     );
     blob1.full_data();
 
@@ -1576,7 +1562,7 @@ fn test_malicious_aggregate_should_not_work() {
         chunk2_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([2; 32]),
+        [2; 32],
     );
 
     blob2.full_data();
@@ -1584,7 +1570,7 @@ fn test_malicious_aggregate_should_not_work() {
     // First block has the two chunks
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1.clone(),
             inclusion_proof: [1u8; 32],
@@ -1617,8 +1603,8 @@ fn test_malicious_aggregate_should_not_work() {
     assert_eq!(output.last_sequencer_commitment_index, 0);
 
     let malicious_aggregate_da_data = DataOnDa::Aggregate(
-        vec![blob1.wtxid().unwrap(), blob2.wtxid().unwrap()],
-        vec![blob1.wtxid().unwrap(), blob2.wtxid().unwrap()],
+        vec![blob1.wtxid(), blob2.wtxid()],
+        vec![blob1.wtxid(), blob2.wtxid()],
     );
     let malicious_aggregate_serialized =
         borsh::to_vec(&malicious_aggregate_da_data).expect("should serialize");
@@ -1628,7 +1614,7 @@ fn test_malicious_aggregate_should_not_work() {
         malicious_aggregate_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([99; 32]),
+        [99; 32],
     );
     malicious_blob.full_data();
 
@@ -1636,7 +1622,7 @@ fn test_malicious_aggregate_should_not_work() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(create_prev_lcp_serialized(output, true)),
+            previous_light_client_proof: Some(create_prev_lcp_serialized(output, true)),
             light_client_proof_method_id,
             da_block_header: block_header_2,
             inclusion_proof: [1u8; 32],
@@ -1678,21 +1664,13 @@ fn test_malicious_aggregate_should_not_work() {
         chunk3_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([3; 32]),
+        [3; 32],
     );
     blob3.full_data();
 
     let aggregate_da_data = DataOnDa::Aggregate(
-        vec![
-            blob1.wtxid().unwrap(),
-            blob2.wtxid().unwrap(),
-            blob3.wtxid().unwrap(),
-        ],
-        vec![
-            blob1.wtxid().unwrap(),
-            blob2.wtxid().unwrap(),
-            blob3.wtxid().unwrap(),
-        ],
+        vec![blob1.wtxid(), blob2.wtxid(), blob3.wtxid()],
+        vec![blob1.wtxid(), blob2.wtxid(), blob3.wtxid()],
     );
 
     let aggregate_serialized = borsh::to_vec(&aggregate_da_data).expect("should serialize");
@@ -1701,7 +1679,7 @@ fn test_malicious_aggregate_should_not_work() {
         aggregate_serialized,
         MockAddress::new([9u8; 32]),
         [0u8; 32],
-        Some([4; 32]),
+        [4; 32],
     );
     blob4.full_data();
 
@@ -1709,7 +1687,7 @@ fn test_malicious_aggregate_should_not_work() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(create_prev_lcp_serialized(output, true)),
+            previous_light_client_proof: Some(create_prev_lcp_serialized(output, true)),
             light_client_proof_method_id,
             da_block_header: block_header_3,
             inclusion_proof: [1u8; 32],
@@ -1795,7 +1773,7 @@ fn test_unknown_block_hash_in_batch_proof_not_verified() {
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1.clone(),
             inclusion_proof: [1u8; 32],
@@ -1867,7 +1845,7 @@ fn test_unknown_block_hash_in_batch_proof_not_verified() {
 
     let input_2 = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(mock_output_1_serialized),
+            previous_light_client_proof: Some(mock_output_1_serialized),
             da_block_header: block_header_2,
             light_client_proof_method_id,
             inclusion_proof: [1u8; 32],
@@ -1930,13 +1908,13 @@ fn test_light_client_circuit_verify_sequencer_commitment() {
         commitment_serialized.clone(),
         MockAddress::new(sequencer_da_pub_key),
         [0u8; 32],
-        Some([1; 32]),
+        [1; 32],
     );
     blob1.full_data();
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1.clone(),
             inclusion_proof: [1u8; 32],
@@ -1980,13 +1958,13 @@ fn test_light_client_circuit_verify_sequencer_commitment() {
         commitment_serialized.clone(),
         MockAddress::new(sequencer_da_pub_key),
         [1u8; 32],
-        Some([2; 32]),
+        [2; 32],
     );
     blob2.full_data();
 
     let input2 = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(mock_output_1_serialized),
+            previous_light_client_proof: Some(mock_output_1_serialized),
             light_client_proof_method_id,
             da_block_header: block_header_2,
             inclusion_proof: [1u8; 32],
@@ -2056,13 +2034,13 @@ fn wrong_pubkey_sequencer_commitment_should_not_work() {
         commitment_serialized.clone(),
         MockAddress::new(sequencer_da_pub_key),
         [0u8; 32],
-        Some([1; 32]),
+        [1; 32],
     );
     blob1.full_data();
 
     let input = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: None,
+            previous_light_client_proof: None,
             light_client_proof_method_id,
             da_block_header: block_header_1.clone(),
             inclusion_proof: [1u8; 32],
@@ -2106,13 +2084,13 @@ fn wrong_pubkey_sequencer_commitment_should_not_work() {
         commitment_serialized.clone(),
         MockAddress::new([54u8; 32]),
         [1u8; 32],
-        Some([2; 32]),
+        [2; 32],
     );
     blob2.full_data();
 
     let input2: LightClientCircuitInput<MockDaSpec> = native_circuit_runner.run(
         LightClientCircuitInput {
-            previous_light_client_proof_journal: Some(mock_output_1_serialized),
+            previous_light_client_proof: Some(mock_output_1_serialized),
             light_client_proof_method_id,
             da_block_header: block_header_2,
             inclusion_proof: [1u8; 32],
@@ -2156,4 +2134,277 @@ fn wrong_pubkey_sequencer_commitment_should_not_work() {
 
     // ignored commitment from wrong pubkey
     assert_eq!(commitment, None);
+}
+
+// If we accept the fact that JMT is not tamperable, we can
+// we only need to check for two scenarios:
+// - If the circuit is inputted from a different tree, we must catch it.
+// - If the value is tampered we must catch it.
+#[should_panic = "jellyfish merkle tree update must succeed"]
+#[test]
+fn test_lcp_input_values_cant_be_tampered() {
+    // set up the test environment with
+    // a few sequencer commitments
+    // and batch proofs that will only process the first sequencer commitment
+    // is enough
+    let db_dir = tempdir().unwrap();
+    let native_circuit_runner = NativeCircuitRunner::new(db_dir.path().to_path_buf());
+    let zk_circuit_runner = LightClientProofCircuit::<ZkStorage, MockDaSpec, MockZkGuest>::new();
+
+    let light_client_proof_method_id = [1u32; 8];
+    let da_verifier = MockDaVerifier {};
+
+    let block_header_1 = MockBlockHeader::from_height(1);
+
+    let seq_comm_1 = create_mock_sequencer_commitment(1, 2, [2u8; 32]);
+    let seq_comm_2 = create_mock_sequencer_commitment(2, 3, [3u8; 32]);
+
+    let seq_comm_1_blob = create_mock_sequencer_commitment_blob(seq_comm_1.clone());
+    let seq_comm_2_blob = create_mock_sequencer_commitment_blob(seq_comm_2.clone());
+
+    let batch_prover_da_pub_key = [9; 32];
+
+    let blob_1 = create_mock_batch_proof(
+        [1u8; 32],
+        2,
+        true,
+        block_header_1.hash.0,
+        vec![seq_comm_1.clone()],
+        None,
+        batch_prover_da_pub_key,
+    );
+
+    let l2_genesis_state_root = [1u8; 32];
+    let sequencer_da_pub_key = [45; 32];
+    let method_id_upgrade_authority = [11u8; 32];
+
+    let input = native_circuit_runner.run(
+        LightClientCircuitInput {
+            previous_light_client_proof: None,
+            light_client_proof_method_id,
+            da_block_header: block_header_1.clone(),
+            inclusion_proof: [1u8; 32],
+            completeness_proof: vec![seq_comm_1_blob, seq_comm_2_blob, blob_1],
+            witness: Default::default(),
+        },
+        l2_genesis_state_root,
+        INITIAL_BATCH_PROOF_METHOD_IDS.to_vec(),
+        &batch_prover_da_pub_key,
+        &sequencer_da_pub_key,
+        &method_id_upgrade_authority,
+    );
+
+    let output_1 = zk_circuit_runner
+        .run_circuit(
+            da_verifier.clone(),
+            input,
+            ZkStorage::new(),
+            Network::Nightly,
+            l2_genesis_state_root,
+            INITIAL_BATCH_PROOF_METHOD_IDS.to_vec(),
+            &batch_prover_da_pub_key,
+            &sequencer_da_pub_key,
+            &method_id_upgrade_authority,
+        )
+        .unwrap();
+
+    // sanity check
+    assert_eq!(output_1.l2_state_root, [2; 32]);
+    assert_eq!(output_1.last_l2_height, 2);
+    assert_eq!(output_1.last_sequencer_commitment_index, 1);
+
+    // environment is set up
+
+    // then we'll make a new run creating an input for correct run
+    let block_header_2 = MockBlockHeader::from_height(2);
+
+    let mut input = native_circuit_runner.run(
+        LightClientCircuitInput {
+            previous_light_client_proof: Some(create_prev_lcp_serialized(output_1, true)),
+            light_client_proof_method_id,
+            da_block_header: block_header_2.clone(),
+            inclusion_proof: [2u8; 32],
+            completeness_proof: vec![],
+            witness: Default::default(),
+        },
+        l2_genesis_state_root,
+        INITIAL_BATCH_PROOF_METHOD_IDS.to_vec(),
+        &batch_prover_da_pub_key,
+        &sequencer_da_pub_key,
+        &method_id_upgrade_authority,
+    );
+
+    // at this point returned witness will look like this:
+    // <VerifiedStateTransitionForSequencerCommitmentIndexAccessor::get(2) val>
+    // <prev root>
+    // <VerifiedStateTransitionForSequencerCommitmentIndexAccessor::get(2) read proof>
+    // <jmt update proof> (includes inserting blockhash)
+    // <final root>
+    // let's try changing the value of VerifiedStateTransitionForSequencerCommitmentIndexAccessor::get(2)
+    // as it was None, we'll try cheating and setting it to Some(VerifiedStateTransitionForSequencerCommitmentIndex{})
+    // this simulates a light client prover that tries to move state of the L2 without a valid batch proof found on DA
+
+    let mut witness = input.witness.get_hints();
+
+    // values are pushed into the witness as so:
+    // borsh::to_vec(Option<StorageValue>)
+
+    let storage_value: StorageValue =
+        borsh::to_vec(&VerifiedStateTransitionForSequencerCommitmentIndex {
+            initial_state_root: [2; 32],
+            final_state_root: [3; 32],
+            last_l2_height: 3,
+        })
+        .unwrap()
+        .into();
+
+    witness[0] = borsh::to_vec(&Some(storage_value)).unwrap();
+
+    // we'll also push a None so that incrementing of VerifiedStateTransitionForSequencerCommitmentIndexAccessor stops
+    witness.insert(1, vec![0]);
+
+    // reusing VerifiedStateTransitionForSequencerCommitmentIndexAccessor::get(2) read proof
+    // for VerifiedStateTransitionForSequencerCommitmentIndexAccessor::get(3) as get(2) will panic already
+    witness.insert(4, witness[3].clone());
+
+    input.witness = witness.into();
+
+    // we are not concerned with trying to forge a JMT read proof for now-existing VerifiedStateTransitionForSequencerCommitmentIndexAccessor(2)
+    // it's impossible for the current tree
+    // or we would add it to the tree, which would then fail because the expected root would be different
+    // trying to forge a JMT update proof for this test case is unnecessary as it means testing JMT itself.
+
+    zk_circuit_runner
+        .run_circuit(
+            da_verifier.clone(),
+            input,
+            ZkStorage::new(),
+            Network::Nightly,
+            l2_genesis_state_root,
+            INITIAL_BATCH_PROOF_METHOD_IDS.to_vec(),
+            &batch_prover_da_pub_key,
+            &sequencer_da_pub_key,
+            &method_id_upgrade_authority,
+        )
+        .unwrap();
+}
+
+// now we'll try to make a new tree that contains the same data except for L1 hashes
+// and then try to replace the prev root with a different one
+// with valid read and update proofs
+// essentially trying to hack the circuit by providing values and proofs from a different tree
+// we make it similar so the circuit won't panic but will follow until the storage verification part
+#[should_panic = "Witness prev root is wrong!"]
+#[test]
+fn test_lcp_cant_be_passed_roots_from_a_different_tree() {
+    // set up the test environment with
+    // a few sequencer commitments
+    // and batch proofs that will only process the first sequencer commitment
+    // is enough
+    let db_dir = tempdir().unwrap();
+    let native_circuit_runner = NativeCircuitRunner::new(db_dir.path().to_path_buf());
+    let zk_circuit_runner = LightClientProofCircuit::<ZkStorage, MockDaSpec, MockZkGuest>::new();
+
+    let light_client_proof_method_id = [1u32; 8];
+    let da_verifier = MockDaVerifier {};
+
+    let block_header_1 = MockBlockHeader::from_height(1);
+
+    let seq_comm_1 = create_mock_sequencer_commitment(1, 2, [2u8; 32]);
+    let seq_comm_2 = create_mock_sequencer_commitment(2, 3, [3u8; 32]);
+
+    let seq_comm_1_blob = create_mock_sequencer_commitment_blob(seq_comm_1.clone());
+    let seq_comm_2_blob = create_mock_sequencer_commitment_blob(seq_comm_2.clone());
+
+    let batch_prover_da_pub_key = [9; 32];
+
+    let blob_1 = create_mock_batch_proof(
+        [1u8; 32],
+        2,
+        true,
+        block_header_1.hash.0,
+        vec![seq_comm_1.clone()],
+        None,
+        batch_prover_da_pub_key,
+    );
+
+    let l2_genesis_state_root = [1u8; 32];
+    let sequencer_da_pub_key = [45; 32];
+    let method_id_upgrade_authority = [11u8; 32];
+
+    let input = native_circuit_runner.run(
+        LightClientCircuitInput {
+            previous_light_client_proof: None,
+            light_client_proof_method_id,
+            da_block_header: block_header_1.clone(),
+            inclusion_proof: [1u8; 32],
+            completeness_proof: vec![seq_comm_1_blob, seq_comm_2_blob, blob_1],
+            witness: Default::default(),
+        },
+        l2_genesis_state_root,
+        INITIAL_BATCH_PROOF_METHOD_IDS.to_vec(),
+        &batch_prover_da_pub_key,
+        &sequencer_da_pub_key,
+        &method_id_upgrade_authority,
+    );
+
+    let output_1 = zk_circuit_runner
+        .run_circuit(
+            da_verifier.clone(),
+            input,
+            ZkStorage::new(),
+            Network::Nightly,
+            l2_genesis_state_root,
+            INITIAL_BATCH_PROOF_METHOD_IDS.to_vec(),
+            &batch_prover_da_pub_key,
+            &sequencer_da_pub_key,
+            &method_id_upgrade_authority,
+        )
+        .unwrap();
+
+    // sanity check
+    assert_eq!(output_1.l2_state_root, [2; 32]);
+    assert_eq!(output_1.last_l2_height, 2);
+    assert_eq!(output_1.last_sequencer_commitment_index, 1);
+
+    // environment is set up
+
+    // let's move to a different tree by inserting a random data
+    native_circuit_runner.insert_random_chunk();
+
+    // we'll use hints from here for the next block
+    // if we can make the circuit accept this new tree
+    // that means we can do anything with the circuit
+
+    let block_header_2 = MockBlockHeader::from_height(2);
+
+    let input = native_circuit_runner.run(
+        LightClientCircuitInput {
+            previous_light_client_proof: Some(create_prev_lcp_serialized(output_1, true)),
+            light_client_proof_method_id,
+            da_block_header: block_header_2.clone(),
+            inclusion_proof: [2u8; 32],
+            completeness_proof: vec![],
+            witness: Default::default(),
+        },
+        l2_genesis_state_root,
+        INITIAL_BATCH_PROOF_METHOD_IDS.to_vec(),
+        &batch_prover_da_pub_key,
+        &sequencer_da_pub_key,
+        &method_id_upgrade_authority,
+    );
+
+    zk_circuit_runner
+        .run_circuit(
+            da_verifier.clone(),
+            input,
+            ZkStorage::new(),
+            Network::Nightly,
+            l2_genesis_state_root,
+            INITIAL_BATCH_PROOF_METHOD_IDS.to_vec(),
+            &batch_prover_da_pub_key,
+            &sequencer_da_pub_key,
+            &method_id_upgrade_authority,
+        )
+        .unwrap();
 }

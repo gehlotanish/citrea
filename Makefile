@@ -1,7 +1,6 @@
 # The release tag of https://github.com/ethereum/tests to use for EF tests
 EF_TESTS_URL := https://github.com/ethereum/tests/archive/refs/tags/v16.0.tar.gz
 EF_TESTS_DIR := crates/evm/ethereum-tests
-CITREA_E2E_TEST_BINARY := $(CURDIR)/target/debug/citrea
 PARALLEL_PROOF_LIMIT := 1
 TEST_FEATURES := --features testing
 BATCH_OUT_PATH := resources/guests/risc0/
@@ -19,10 +18,6 @@ build-sp1:
 .PHONY: build
 build: ## Build the project
 	@cargo build
-
-.PHONY: build-test
-build-test: $(EF_TESTS_DIR) ## Build the project
-	@cargo build --locked $(TEST_FEATURES)
 
 build-reproducible: build-sp1 ## Build the project in release mode with reproducible guest builds
 	REPR_GUEST_BUILD=1 cargo build --release --locked
@@ -48,41 +43,43 @@ clean-docker:
 
 clean-all: clean clean-node clean-txs
 
-test-legacy: ## Runs test suite with output from tests printed
-	@cargo test -- --nocapture -Zunstable-options --report-time
+test-nocapture: ## Runs test suite with output from tests printed
+	PARALLEL_PROOF_LIMIT=1 cargo nextest run --no-capture --retries 0 --locked --workspace --all-features --no-fail-fast $(filter-out $@,$(MAKECMDGOALS))
 
-test-ci:
-	RISC0_DEV_MODE=1 PARALLEL_PROOF_LIMIT=1 cargo nextest run -j15 --locked --workspace --all-features --no-fail-fast $(filter-out $@,$(MAKECMDGOALS))
+test: $(EF_TESTS_DIR) ## Runs test suite using nextest
+	PARALLEL_PROOF_LIMIT=1 cargo nextest run -j15 --locked --workspace --all-features --no-fail-fast $(filter-out $@,$(MAKECMDGOALS))
 
-coverage-ci:
-	RISC0_DEV_MODE=1 PARALLEL_PROOF_LIMIT=1 cargo llvm-cov --locked --lcov --output-path lcov.info nextest -j10 --workspace --all-features
-
-test: build-test ## Runs test suite using next test
-	TEST_SKIP_GUEST_BUILD=1 $(MAKE) test-ci -- $(filter-out $@,$(MAKECMDGOALS))
-
-coverage: build-test coverage-ci ## Coverage in lcov format
+coverage: $(EF_TESTS_DIR) ## Coverage in lcov format
+	CITREA_CLI_E2E_TEST_BINARY=$(CURDIR)/target/llvm-cov-target/debug/citrea-cli \
+	CITREA_E2E_TEST_BINARY=$(CURDIR)/target/llvm-cov-target/debug/citrea \
+	PARALLEL_PROOF_LIMIT=1 \
+	cargo llvm-cov --locked --lcov --output-path lcov.info nextest -j10 --workspace --all-features
 
 coverage-html: ## Coverage in HTML format
 	cargo llvm-cov --locked --all-features --html nextest --workspace --all-features
 
 install-dev-tools:  ## Installs all necessary cargo helpers
-	cargo install --locked dprint
-	cargo install cargo-llvm-cov
-	cargo install cargo-hack
-	cargo install --locked cargo-udeps
-	cargo install flaky-finder
-	cargo install --locked cargo-nextest
+	cargo install --locked dprint --version 0.49.1
+	cargo install cargo-llvm-cov --version 0.6.16
+	cargo install cargo-hack --version 0.6.36
+	cargo install --locked cargo-udeps --version 0.1.55
+	cargo install --locked cargo-nextest --version 0.9.95
 	$(MAKE) install-risc0
 	rustup target add thumbv6m-none-eabi
 	rustup component add llvm-tools-preview
-	$(MAKE) install-sp1
+	# $(MAKE) install-sp1
 
 install-risc0:
 	curl -L https://risczero.com/install | bash && \
 	([ -f $$HOME/.bashrc ] && source $$HOME/.bashrc || true) && \
 	([ -f $$HOME/.zshrc ] && source $$HOME/.zshrc || true) && \
-	rzup install && \
-	rzup install rust 1.85.0
+	rzup install cargo-risczero 2.3.1 && \
+	rzup install cpp && \
+	rzup install r0vm 2.3.1 && \
+	rzup install rust 1.85.0 && \
+	rzup default cargo-risczero 2.3.1 && \
+	rzup default r0vm 2.3.1 && \
+	rzup default rust 1.85.0
 
 install-sp1: ## Install necessary SP1 toolchain
 	curl -L https://sp1.succinct.xyz | bash
@@ -97,8 +94,8 @@ lint:  ## cargo check and clippy. Skip clippy on guest code since it's not suppo
 
 lint-fix:  ## dprint fmt, cargo fmt, fix and clippy. Skip clippy on guest code since it's not supported by risc0
 	dprint fmt
-	cargo fix --allow-dirty
-	SKIP_GUEST_BUILD=1 cargo clippy --fix --allow-dirty
+	cargo fix --allow-dirty --all-features
+	SKIP_GUEST_BUILD=1 cargo clippy --fix --allow-dirty --all-features
 	cargo +nightly fmt --all
 
 check-features: ## Checks that project compiles with all combinations of features.
@@ -106,9 +103,6 @@ check-features: ## Checks that project compiles with all combinations of feature
 
 find-unused-deps: ## Prints unused dependencies for project. Note: requires nightly
 	cargo +nightly udeps --all-targets --all-features
-
-find-flaky-tests:  ## Runs tests over and over to find if there's flaky tests
-	flaky-finder -j16 -r320 --continue "cargo test -- --nocapture"
 
 docs:  ## Generates documentation locally
 	cargo doc --open

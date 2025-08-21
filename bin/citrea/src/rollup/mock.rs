@@ -4,7 +4,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use citrea_common::backup::{create_backup_rpc_module, BackupManager};
 use citrea_common::config::ProverGuestRunConfig;
-use citrea_common::rpc::register_healthcheck_rpc;
 use citrea_common::{FullNodeConfig, RpcConfig};
 use citrea_primitives::forks::use_network_forks;
 // use citrea_sp1::host::SP1Host;
@@ -19,7 +18,6 @@ use sov_modules_api::default_context::DefaultContext;
 use sov_modules_api::{Address, Spec, SpecId, Zkvm};
 use sov_modules_rollup_blueprint::RollupBlueprint;
 use sov_prover_storage_manager::ProverStorageManager;
-use tokio::sync::broadcast;
 
 use crate::guests::{BATCH_PROOF_LATEST_MOCK_GUESTS, LIGHT_CLIENT_LATEST_MOCK_GUESTS};
 use crate::{CitreaRollupBlueprint, Network};
@@ -48,9 +46,7 @@ impl RollupBlueprint for MockDemoRollup {
         &self,
         storage: <DefaultContext as Spec>::Storage,
         ledger_db: &LedgerDB,
-        da_service: &Arc<Self::DaService>,
-        sequencer_client_url: Option<String>,
-        l2_block_rx: Option<broadcast::Receiver<u64>>,
+        _da_service: &Arc<Self::DaService>,
         backup_manager: &Arc<BackupManager>,
         rpc_config: RpcConfig,
     ) -> Result<jsonrpsee::RpcModule<()>, anyhow::Error> {
@@ -62,16 +58,6 @@ impl RollupBlueprint for MockDemoRollup {
             CitreaRuntime<DefaultContext, Self::DaSpec>,
         >(storage.clone(), ledger_db, sequencer, rpc_config)?;
 
-        crate::eth::register_ethereum::<Self::DaService>(
-            da_service.clone(),
-            storage,
-            ledger_db.clone(),
-            &mut rpc_methods,
-            sequencer_client_url,
-            l2_block_rx,
-        )?;
-
-        register_healthcheck_rpc(&mut rpc_methods, ledger_db.clone())?;
         let backup_methods = create_backup_rpc_module(ledger_db.clone(), backup_manager.clone());
         rpc_methods.merge(backup_methods)?;
 
@@ -83,15 +69,12 @@ impl RollupBlueprint for MockDemoRollup {
         rollup_config: &FullNodeConfig<Self::DaConfig>,
         _require_wallet_check: bool,
         _task_manager: TaskExecutor,
+        _network: Network,
     ) -> Result<Arc<Self::DaService>, anyhow::Error> {
         Ok(Arc::new(MockDaService::new(
             rollup_config.da.sender_address.clone(),
             &rollup_config.da.db_path,
         )))
-    }
-
-    fn create_da_verifier(&self) -> Self::DaVerifier {
-        Default::default()
     }
 
     fn get_batch_proof_elfs(&self) -> HashMap<SpecId, Vec<u8>> {

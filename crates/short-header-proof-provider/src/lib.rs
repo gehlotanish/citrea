@@ -3,10 +3,10 @@ mod native;
 mod zk;
 
 use std::ops::RangeInclusive;
+use std::sync::OnceLock;
 
 #[cfg(feature = "native")]
 pub use native::*;
-use once_cell::sync::OnceCell;
 use thiserror::Error;
 pub use zk::*;
 
@@ -14,6 +14,8 @@ pub use zk::*;
 pub enum ShortHeaderProofProviderError {
     #[error("Short header proof not found")]
     ShortHeaderProofNotFound,
+    #[error("Short header proof Vector Allocation Failed")]
+    VectorAllocationFailed(String),
 }
 
 /// Short Header Proof Provider
@@ -35,12 +37,15 @@ pub trait ShortHeaderProofProvider: Send + Sync {
     fn clear_queried_hashes(&self);
 
     /// Takes the queried short header proofs
-    fn take_queried_hashes(&self, l2_range: RangeInclusive<u64>) -> Vec<[u8; 32]>;
+    fn take_queried_hashes(
+        &self,
+        l2_range: RangeInclusive<u64>,
+    ) -> Result<Vec<[u8; 32]>, ShortHeaderProofProviderError>;
 
     /// Takes the last queried header hash
     /// Consequent calls will return None
     fn take_last_queried_hash(&self) -> Option<[u8; 32]>;
 }
 
-pub static SHORT_HEADER_PROOF_PROVIDER: OnceCell<Box<dyn ShortHeaderProofProvider>> =
-    OnceCell::new();
+pub static SHORT_HEADER_PROOF_PROVIDER: OnceLock<Box<dyn ShortHeaderProofProvider>> =
+    OnceLock::new();

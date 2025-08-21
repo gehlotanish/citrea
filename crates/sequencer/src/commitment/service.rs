@@ -1,11 +1,10 @@
-use std::cmp;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
+use citrea_common::utils::get_tangerine_activation_height_non_zero;
 use citrea_evm::{get_last_l1_height_in_light_client, Evm};
-use citrea_primitives::forks::get_tangerine_activation_height_non_zero;
 use citrea_primitives::types::L2BlockHash;
 use citrea_stf::runtime::DefaultContext;
 use reth_tasks::shutdown::GracefulShutdown;
@@ -19,26 +18,33 @@ use sov_rollup_interface::da::{BlockHeaderTrait, DaTxRequest, SequencerCommitmen
 use sov_rollup_interface::services::da::{DaService, TxRequestWithNotifier};
 use sov_state::ProverStorage;
 use tokio::select;
-use tokio::sync::oneshot;
-use tracing::{debug, error, info, instrument};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::controller::CommitmentController;
-use super::helpers::load_next_commitment_index;
-use crate::metrics::SEQUENCER_METRICS;
+use crate::metrics::SEQUENCER_METRICS as SM;
 
 /// L2 heights to commit
 pub(crate) type CommitmentRange = RangeInclusive<L2BlockNumber>;
 
+/// Service responsible for managing and processing sequencer commitments
 pub struct CommitmentService<Da, Db>
 where
     Da: DaService,
     Db: SequencerLedgerOps,
 {
+    /// The ledger database interface for state operations
     ledger_db: Db,
+    /// Data availability service interface
     da_service: Arc<Da>,
+    /// Public key used for signing commitments
     sequencer_da_pub_key: Vec<u8>,
-    next_commitment_index: u32,
-    commitment_controller: Option<CommitmentController<Db>>,
+    /// Maximum number of L2 blocks that can be included in a single commitment
+    max_l2_blocks: u64,
+    /// Channel for receiving halt signals from the runner
+    halt_rx: mpsc::UnboundedReceiver<bool>,
+    /// Current commitment production state
+    is_producing_commitments: bool,
 }
 
 impl<Da, Db> CommitmentService<Da, Db>
@@ -46,24 +52,35 @@ where
     Da: DaService,
     Db: SequencerLedgerOps + Clone + Send + Sync + 'static,
 {
+    /// Creates a new commitment service instance
+    ///
+    /// # Arguments
+    /// * `ledger_db` - The ledger database interface
+    /// * `da_service` - Data availability service interface
+    /// * `sequencer_da_pub_key` - Public key for signing commitments
+    /// * `max_l2_blocks` - Maximum number of L2 blocks per commitment
+    /// * `halt_rx` - Channel for receiving halt signals
+    ///
+    /// # Returns
+    /// A new CommitmentService instance
     pub fn new(
         ledger_db: Db,
         da_service: Arc<Da>,
         sequencer_da_pub_key: Vec<u8>,
-        min_l2_blocks: u64,
+        max_l2_blocks: u64,
+        halt_rx: mpsc::UnboundedReceiver<bool>,
     ) -> Self {
-        let commitment_controller =
-            Some(CommitmentController::new(ledger_db.clone(), min_l2_blocks));
-        let next_commitment_index = load_next_commitment_index(&ledger_db);
         Self {
             ledger_db,
             da_service,
             sequencer_da_pub_key,
-            next_commitment_index,
-            commitment_controller,
+            max_l2_blocks,
+            halt_rx,
+            is_producing_commitments: true,
         }
     }
 
+    #[instrument(name = "CommitmentService", skip_all)]
     pub async fn run(
         mut self,
         storage_manager: ProverStorageManager,
@@ -80,59 +97,55 @@ where
             }
         }
 
-        let check_new_block_time = Duration::from_secs(2);
-        let mut check_new_block_tick = tokio::time::interval(check_new_block_time);
+        let commitment_controller = Arc::new(CommitmentController::new(
+            self.ledger_db.clone(),
+            self.max_l2_blocks,
+        ));
+        // This is not the head l2 height but the latest commitment's l2 height
+        let mut last_l2_height = commitment_controller.last_l2_height();
+
+        let mut check_new_block_tick = tokio::time::interval(Duration::from_secs(2));
         check_new_block_tick.tick().await;
 
-        // Get latest finalized and pending commitments and find the max height
-        let last_finalized_l2_height = match self.ledger_db.get_last_commitment() {
-            Ok(seq) => seq
-                .map(|seq| L2BlockNumber(seq.l2_end_block_number))
-                .unwrap_or(L2BlockNumber(0)),
-            Err(e) => {
-                error!("Could not fetch last commitment: {:?}", e);
-                return;
-            }
-        };
-        let last_pending_l2_height = match self.ledger_db.get_pending_commitments() {
-            Ok(commitments) => commitments
-                .iter()
-                .map(|seq| L2BlockNumber(seq.l2_end_block_number))
-                .max()
-                .unwrap_or(L2BlockNumber(0)),
-            Err(e) => {
-                error!("Could not read pending sequencer commitments: {:?}", e);
-                return;
-            }
-        };
-        let mut from_l2_height = L2BlockNumber(cmp::max(
-            cmp::max(last_finalized_l2_height, last_pending_l2_height).0 + 1,
-            get_tangerine_activation_height_non_zero(),
-        ));
-
-        let commitment_controller = Arc::new(
-            self.commitment_controller
-                .take()
-                .expect("Commitment controller should be present"),
-        );
-
         loop {
+            let mut start_commitment_processing = Instant::now();
             select! {
                 biased;
                 _ = &mut shutdown_signal => {
+                    info!("CommitmentService shutting down");
                     return;
                 },
-                _ = check_new_block_tick.tick() => {
-                    let head_l2_height = match self.ledger_db.get_head_l2_block_height() {
-                        Ok(head_l2_height) => L2BlockNumber(head_l2_height.unwrap_or(0)),
-                        Err(e) => {
-                            error!("Failed to fetch head L2 height: {:?}", e);
+                // Handle halt signals from the runner
+                halt_signal = self.halt_rx.recv() => {
+                    match halt_signal {
+                        Some(should_halt) => {
+                            let should_run = !should_halt;
+                            if self.is_producing_commitments != should_run {
+                                self.is_producing_commitments = should_run;
+                                if should_halt {
+                                    warn!("CommitmentService: Commitments halted via RPC");
+                                } else {
+                                    info!("CommitmentService: Commitments resumed via RPC");
+                                }
+                            }
+                        }
+                        None => {
+                            // Channel closed, should shutdown
+                            warn!("CommitmentService: Halt signal channel closed");
                             return;
                         }
-                    };
+                    }
+                },
+                _ = check_new_block_tick.tick() => {
+                    // Skip commitment processing if not running
+                    if !self.is_producing_commitments {
+                        debug!("CommitmentService: Skipping commitment processing (halted)");
+                        continue;
+                    }
 
+                    let head_l2_height = self.ledger_db.get_head_l2_block_height().expect("Failed to fetch head L2 height").unwrap_or(0);
                     // No need to check commitment criteria if the start L2 block number did not change.
-                    if head_l2_height <= from_l2_height {
+                    if head_l2_height <= last_l2_height {
                         continue;
                     }
 
@@ -141,70 +154,70 @@ where
                     // the max amount of blocks we commit for.
                     // Instead, we loop here from the last commitment height + 1 incrementally and commit
                     // as soon as we find a block which signals the possibility of a commitment.
-                    for current_l2_height in from_l2_height.0..=head_l2_height.0 {
+                    for current_l2_height in (last_l2_height + 1)..=head_l2_height {
                         let cc = commitment_controller.clone();
 
-                        let Ok(commitment_info) = tokio::task::spawn_blocking(move || {
-                            cc.should_commit(from_l2_height, L2BlockNumber(current_l2_height))
-                        }).await else {
-                            error!("Failed to check commitment criteria");
-                            continue;
-                        };
-
-                        let commitment_info = match commitment_info {
-                            Ok(Some(commitment_info)) => {
-                                commitment_info
-                            },
-                            Err(e) => {
-                                error!("Error while checking commitment criteria: {:?}", e);
-                                continue;
-                            },
-                            _ => {
-                                continue;
+                        let should_commit = tokio::task::spawn_blocking(move || {
+                            cc.should_commit(L2BlockNumber(current_l2_height))
+                        }).await;
+                        if let Some((index, commitment_range)) = should_commit
+                            .expect("Commit check tokio blocking task failed")
+                            .expect("Commitment criteria check failed")
+                        {
+                            if let Err(e) = self.commit(index, commitment_range.clone()).await {
+                                // We just log error and continue here as the controller updated its internal state and it can
+                                // continue functioning correctly. We just need to resubmit the failed commitment to DA.
+                                error!("Failed to submit commitment: {:?}", e);
                             }
+
+                            record_commitment_process_duration_metrics(
+                                start_commitment_processing,
+                                index,
+                                *commitment_range.start(),
+                                *commitment_range.end(),
+                            );
+                            // Reset the start time for the next commitment processing
+                            start_commitment_processing = Instant::now();
                         };
 
-                        commitment_controller.reset();
-                        if let Err(e) = commitment_controller.clear_commitment_state_diffs(commitment_info.start().0..=commitment_info.end().0) {
-                            error!("Could not clear commitment state diffs: {:?}", e);
-                        }
-
-                        let index = self.next_commitment_index;
-
-                        from_l2_height = L2BlockNumber(commitment_info.end().0 + 1);
-
-                        if let Err(e) = self.commit(index, &commitment_info).await {
-                            error!("Could not submit commitment: {:?}", e);
-                        }
-
-                        // Stop and let the next tick start from the last set `from_l2_height`
-                        break;
+                        last_l2_height = current_l2_height;
                     }
                 },
             }
         }
     }
 
+    /// Commits a range of L2 blocks to the data availability layer
+    ///
+    /// # Arguments
+    /// * `commitment_index` - Index of the commitment
+    /// * `commitment_range` - Range of L2 blocks to commit
+    /// * `processed_storage_update` - Processed storage updates to include
+    /// * `l1_head` - Current L1 block height
+    ///
+    /// # Returns
+    /// Result indicating success or failure of the commitment operation
     pub async fn commit(
         &mut self,
         commitment_index: u32,
-        commitment_info: &CommitmentRange,
+        commitment_range: CommitmentRange,
     ) -> anyhow::Result<()> {
-        let l2_start = *commitment_info.start();
-        let l2_end = *commitment_info.end();
+        let l2_start = *commitment_range.start();
+        let l2_end = *commitment_range.end();
 
         let l2_block_hashes = self
             .ledger_db
-            .get_l2_block_range(commitment_info)?
+            .get_l2_block_range(&commitment_range)?
             .iter()
             .map(|sb| sb.hash)
             .collect::<Vec<[u8; 32]>>();
 
-        SEQUENCER_METRICS
-            .commitment_blocks_count
-            .set(l2_block_hashes.len() as f64);
+        SM.commitment_blocks_count.set(l2_block_hashes.len() as f64);
 
-        let commitment = self.get_commitment(commitment_index, commitment_info, l2_block_hashes)?;
+        SM.currently_committing_index.set(commitment_index as f64);
+
+        let commitment =
+            self.get_commitment(commitment_index, &commitment_range, l2_block_hashes)?;
 
         debug!("Sequencer: submitting commitment: {:?}", commitment);
 
@@ -239,7 +252,7 @@ where
             .map_err(|_| anyhow!("DA service is dead!"))?
             .map_err(|_| anyhow!("Send transaction cannot fail"))?;
 
-        SEQUENCER_METRICS.send_commitment_execution.record(
+        SM.send_commitment_execution.record(
             Instant::now()
                 .saturating_duration_since(start)
                 .as_secs_f64(),
@@ -251,8 +264,8 @@ where
 
         ledger_db.delete_pending_commitment(commitment.index)?;
 
-        // Increment the next commitment index here knowing that it completed successfully.
-        self.next_commitment_index += 1;
+        self.ledger_db
+            .delete_state_diff_by_range(commitment_range)?;
 
         info!("New commitment. L2 range: #{}-{}", l2_start.0, l2_end.0);
 
@@ -341,7 +354,7 @@ where
                 let range = L2BlockNumber(l2_start_block_number)
                     ..=L2BlockNumber(pending_db_comm.l2_end_block_number);
 
-                self.commit(pending_db_comm.index, &range).await?;
+                self.commit(pending_db_comm.index, range).await?;
             }
         }
 
@@ -352,12 +365,12 @@ where
     pub fn get_commitment(
         &self,
         commitment_index: u32,
-        commitment_info: &CommitmentRange,
+        commitment_range: &CommitmentRange,
         l2_block_hashes: Vec<[u8; 32]>,
     ) -> anyhow::Result<SequencerCommitment> {
         // sanity check
         assert_eq!(
-            commitment_info.end().0 - commitment_info.start().0 + 1u64,
+            commitment_range.end().0 - commitment_range.start().0 + 1u64,
             l2_block_hashes.len() as u64,
             "Sequencer: Soft confirmation hashes length does not match the commitment info"
         );
@@ -368,16 +381,27 @@ where
         Ok(SequencerCommitment {
             merkle_root,
             index: commitment_index,
-            l2_end_block_number: commitment_info.end().0,
+            l2_end_block_number: commitment_range.end().0,
         })
     }
 
+    /// Retrieves pending sequencer commitments from the mempool
+    ///
+    /// # Returns
+    /// A vector of pending sequencer commitments
     async fn get_pending_mempool_commitments(&self) -> Vec<SequencerCommitment> {
         self.da_service
             .get_pending_sequencer_commitments(&self.sequencer_da_pub_key)
             .await
     }
 
+    /// Retrieves mined commitments starting from a specific height
+    ///
+    /// # Arguments
+    /// * `start_height` - Starting L1 block height to search from
+    ///
+    /// # Returns
+    /// Result containing a vector of mined sequencer commitments
     async fn get_mined_commitments_from(
         &self,
         start_height: u64,
@@ -411,4 +435,24 @@ where
 
         Ok(mined_commitments)
     }
+}
+
+/// Records metrics related to the commitment processing duration
+fn record_commitment_process_duration_metrics(
+    start: Instant,
+    commitment_index: u32,
+    l2_start_height: L2BlockNumber,
+    l2_end_height: L2BlockNumber,
+) {
+    let duration = Instant::now()
+        .saturating_duration_since(start)
+        .as_secs_f64();
+    SM.latest_sequencer_commitment_process_duration_secs
+        .set(duration);
+    SM.latest_sequencer_commitment_index
+        .set(commitment_index as f64);
+    SM.latest_sequencer_commitment_l2_start_height
+        .set(l2_start_height.0 as f64);
+    SM.latest_sequencer_commitment_l2_end_height
+        .set(l2_end_height.0 as f64);
 }

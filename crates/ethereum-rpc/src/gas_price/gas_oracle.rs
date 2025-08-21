@@ -4,8 +4,9 @@
 
 // Adopted from: https://github.com/paradigmxyz/reth/blob/main/crates/rpc/rpc/src/eth/gas_oracle.rs
 
+use alloy_consensus::BlockHeader;
 use alloy_network::eip2718::Typed2718;
-use alloy_network::AnyNetwork;
+use alloy_network::{AnyNetwork, BlockResponse};
 use alloy_primitives::{B256, U256};
 use alloy_rpc_types::{
     BlockNumberOrTag, BlockTransactions, FeeHistory, Transaction, TransactionTrait,
@@ -16,6 +17,7 @@ use parking_lot::Mutex;
 use reth_rpc_eth_api::RpcTransaction;
 use reth_rpc_eth_types::error::{EthApiError, EthResult, RpcInvalidTransactionError};
 use serde::{Deserialize, Serialize};
+use sov_db::ledger_db::LedgerDB;
 use sov_modules_api::WorkingSet;
 use tracing::warn;
 
@@ -108,6 +110,8 @@ pub struct GasPriceOracle<C: sov_modules_api::Context> {
     last_price: Mutex<GasPriceOracleResult>,
     /// Fee history cache with lifetime
     fee_history_cache: Mutex<FeeHistoryCache<C>>,
+    /// LedgerDb
+    ledger_db: LedgerDB,
 }
 
 impl<C: sov_modules_api::Context> GasPriceOracle<C> {
@@ -116,6 +120,7 @@ impl<C: sov_modules_api::Context> GasPriceOracle<C> {
         provider: Evm<C>,
         mut oracle_config: GasPriceOracleConfig,
         fee_history_config: FeeHistoryCacheConfig,
+        ledger_db: LedgerDB,
     ) -> Self {
         // sanitize the percentile to be less than 100
         if oracle_config.percentile > 100 {
@@ -125,7 +130,7 @@ impl<C: sov_modules_api::Context> GasPriceOracle<C> {
 
         let max_header_history = oracle_config.max_header_history as u32;
 
-        let block_cache = BlockCache::new(max_header_history, provider.clone());
+        let block_cache = BlockCache::new(max_header_history, provider.clone(), ledger_db.clone());
         let fee_history_cache = FeeHistoryCache::new(fee_history_config, block_cache);
 
         Self {
@@ -133,6 +138,7 @@ impl<C: sov_modules_api::Context> GasPriceOracle<C> {
             oracle_config,
             last_price: Default::default(),
             fee_history_cache: Mutex::new(fee_history_cache),
+            ledger_db,
         }
     }
 
@@ -164,9 +170,9 @@ impl<C: sov_modules_api::Context> GasPriceOracle<C> {
             block_count = max_fee_history
         }
 
-        let end_block = self
-            .provider
-            .block_number_for_id(&newest_block, working_set)?;
+        let end_block =
+            self.provider
+                .block_number_for_id(&newest_block, working_set, &self.ledger_db)?;
 
         // need to add 1 to the end block to get the correct (inclusive) range
         let end_block_plus = end_block + 1;
@@ -247,7 +253,7 @@ impl<C: sov_modules_api::Context> GasPriceOracle<C> {
     pub fn suggest_tip_cap(&self, working_set: &mut WorkingSet<C::Storage>) -> EthResult<u128> {
         let header = &self
             .provider
-            .get_block_by_number(None, None, working_set)
+            .get_block_by_number(None, None, working_set, &self.ledger_db)
             .unwrap()
             .unwrap()
             .header;
@@ -339,60 +345,61 @@ impl<C: sov_modules_api::Context> GasPriceOracle<C> {
             let mut cache = self.fee_history_cache.lock();
             cache.block_cache.get_block(block_hash, working_set)?
         };
-        let block = match block_hit {
+        let mut block = match block_hit {
             Some(block) => block,
             None => return Ok(None),
         };
 
-        // sort the transactions by effective tip
-        // but first filter those that should be ignored
+        let base_fee_per_gas = block.header().base_fee_per_gas();
+        let parent_hash = block.header().parent_hash();
+        let beneficiary = block.header().beneficiary();
 
         // get the transactions (block.transactions is a enum but we only care about the 2nd arm)
-        let txs = match &block.transactions {
+        let txs = match &mut block.transactions {
             BlockTransactions::Full(txs) => txs,
             _ => return Ok(None),
         };
+        // sort the transactions by ascending effective tip first
+        txs.sort_by_cached_key(|tx| {
+            if let Some(base_fee) = base_fee_per_gas {
+                (*tx).effective_tip_per_gas(base_fee)
+            } else {
+                Some((*tx).priority_fee_or_price())
+            }
+        });
 
-        let mut txs = txs
-            .iter()
-            .filter(|tx| {
-                if let Some(ignore_under) = self.oracle_config.ignore_price {
-                    let effective_gas_tip = effective_gas_tip(
-                        tx,
-                        block.header.base_fee_per_gas.map(|basefee| basefee as u128),
-                    );
-                    if effective_gas_tip < Some(ignore_under) {
-                        return false;
-                    }
+        let mut prices = Vec::with_capacity(limit);
+
+        for tx in txs {
+            let effective_tip = if let Some(base_fee) = base_fee_per_gas {
+                tx.effective_tip_per_gas(base_fee)
+            } else {
+                Some(tx.priority_fee_or_price())
+            };
+
+            // ignore transactions with a tip under the configured threshold
+            if let Some(ignore_under) = self.oracle_config.ignore_price {
+                if effective_tip < Some(ignore_under) {
+                    continue;
                 }
+            }
 
-                // check if coinbase
-                let sender = tx.inner.signer();
-                sender != block.header.beneficiary && sender != SYSTEM_SIGNER
-            })
-            // map all values to effective_gas_tip because we will be returning those values
-            // anyways
-            .map(|tx| {
-                effective_gas_tip(
-                    tx,
-                    block.header.base_fee_per_gas.map(|basefee| basefee as u128),
-                )
-            })
-            .collect::<Vec<_>>();
+            // check if the sender was the coinbase, if so, ignore
+            if tx.inner.signer() == beneficiary || tx.inner.signer() == SYSTEM_SIGNER {
+                continue;
+            }
 
-        // now do the sort
-        txs.sort_unstable();
-
-        // fill result with the top `limit` transactions
-        let mut final_result = Vec::with_capacity(limit);
-        for tx in txs.iter().take(limit) {
             // a `None` effective_gas_tip represents a transaction where the max_fee_per_gas is
-            // less than the base fee
-            let effective_tip = tx.ok_or(RpcInvalidTransactionError::FeeCapTooLow)?;
-            final_result.push(effective_tip);
+            // less than the base fee which would be invalid
+            prices.push(effective_tip.ok_or(RpcInvalidTransactionError::FeeCapTooLow)?);
+
+            // we have enough entries
+            if prices.len() >= limit {
+                break;
+            }
         }
 
-        Ok(Some((block.header.parent_hash, final_result)))
+        Ok(Some((parent_hash, prices)))
     }
 
     /// Approximates reward at a given percentile for a specific block
@@ -430,30 +437,6 @@ impl Default for GasPriceOracleResult {
             // Defaults to 0 so that priority fee is low when there are no txs to calculate a median tip
             price: 0_u128,
         }
-    }
-}
-
-// Adopted from: https://github.com/paradigmxyz/reth/blob/main/crates/primitives/src/transaction/mod.rs#L297
-pub(crate) fn effective_gas_tip(transaction: &Transaction, base_fee: Option<u128>) -> Option<u128> {
-    let priority_fee_or_price = match transaction.ty() {
-        2 => transaction.max_priority_fee_per_gas().unwrap(),
-        _ => transaction.gas_price().unwrap(),
-    };
-
-    if let Some(base_fee) = base_fee {
-        let max_fee_per_gas = match transaction.ty() {
-            2 => transaction.max_priority_fee_per_gas().unwrap(),
-            _ => transaction.gas_price().unwrap(),
-        };
-
-        if max_fee_per_gas < base_fee {
-            None
-        } else {
-            let effective_max_fee = max_fee_per_gas - base_fee;
-            Some(std::cmp::min(effective_max_fee, priority_fee_or_price))
-        }
-    } else {
-        Some(priority_fee_or_price)
     }
 }
 

@@ -2,11 +2,15 @@
 //!
 use std::sync::{Arc, Mutex};
 
+use metrics::counter;
+
 use crate::schema::{KeyCodec, KeyDecoder, ValueCodec};
 use crate::schema_batch::SchemaBatchIterator;
 use crate::{Operation, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder, DB};
 
-/// Wrapper around [`DB`] which allows caching writes in memory.
+/// Wrapper around [`DB`] which allows caching writes in memory. This struct stores all
+/// writes in memory, and then writes them to the database in a single atomic operation.
+/// This makes rollbacking and atomicity of writes easier.
 #[derive(Debug)]
 pub struct DbTransaction {
     cache: Mutex<SchemaBatch>,
@@ -62,9 +66,11 @@ impl DbTransaction {
 
         // 1. Check in cache
         if let Some(operation) = local_cache.read(key)? {
+            // Record Cache hit
+            counter!("schemadb_cache_hits", "cf_name" => S::COLUMN_FAMILY_NAME).increment(1);
             return decode_operation::<S>(operation);
         }
-
+        counter!("schemadb_cache_misses", "cf_name" => S::COLUMN_FAMILY_NAME).increment(1);
         self.db.get(key)
     }
 
@@ -130,6 +136,9 @@ impl From<DbTransaction> for SchemaBatch {
     }
 }
 
+/// Ordered iterator over the [`DbTransaction`] cache and the underlying database.
+/// RocksDB iteration is strictly ordered, and since we store some of the writes in memory,
+/// we need a custom iterator to handle 2 iterators, cache and db, managing the ordering.
 struct DbTransactionIter<'a, S, LocalIter, DbIter>
 where
     S: Schema,
@@ -163,15 +172,23 @@ where
                     if next.is_none() {
                         continue;
                     }
+                    counter!("schemadb_cache_hits", "cf_name" => S::COLUMN_FAMILY_NAME)
+                        .increment(1);
                     return next;
                 }
                 // Local exhausted
                 (None, Some((_key, _value))) => {
+                    // not sure on this
+                    counter!("schemadb_cache_misses", "cf_name" => S::COLUMN_FAMILY_NAME)
+                        .increment(1);
                     return self.db_iter.next();
                 }
                 // Both are active, need to compare keys
                 (Some(&(local_key, local_operation)), Some((db_key, _db_value))) => {
                     return if local_key < db_key {
+                        // not sure on this
+                        counter!("schemadb_cache_misses", "cf_name" => S::COLUMN_FAMILY_NAME)
+                            .increment(1);
                         self.db_iter.next()
                     } else {
                         // Local is preferable, as it is the latest
@@ -184,6 +201,8 @@ where
                         if next.is_none() {
                             continue;
                         }
+                        counter!("schemadb_cache_hits", "cf_name" => S::COLUMN_FAMILY_NAME)
+                            .increment(1);
                         next
                     };
                 }

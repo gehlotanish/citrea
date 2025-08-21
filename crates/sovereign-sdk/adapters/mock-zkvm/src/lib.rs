@@ -2,7 +2,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -135,6 +135,7 @@ impl sov_rollup_interface::zk::Zkvm for MockZkvm {
     fn verify(
         serialized_proof: &[u8],
         code_commitment: &Self::CodeCommitment,
+        _allow_dev_mode: bool,
     ) -> Result<(), Self::Error> {
         let proof = MockProof::decode(serialized_proof)?;
         anyhow::ensure!(
@@ -161,9 +162,10 @@ impl sov_rollup_interface::zk::Zkvm for MockZkvm {
     fn verify_and_deserialize_output<T: BorshDeserialize>(
         serialized_proof: &[u8],
         code_commitment: &Self::CodeCommitment,
+        _allow_dev_mode: bool,
     ) -> Result<T, Self::Error> {
-        Self::verify(serialized_proof, code_commitment)?;
-        Ok(T::deserialize(&mut &serialized_proof[33..])?)
+        Self::verify(serialized_proof, code_commitment, true)?;
+        Self::deserialize_output(&serialized_proof[37..])
     }
 }
 
@@ -188,7 +190,7 @@ impl sov_rollup_interface::zk::ZkvmHost for MockZkvm {
 
     fn simulate_with_hints(&mut self) -> Self::Guest {
         MockZkGuest {
-            input: vec![],
+            input: RwLock::new(Cursor::new(vec![])),
             output: RwLock::new(vec![]),
         }
     }
@@ -226,7 +228,7 @@ impl sov_rollup_interface::zk::ZkvmHost for MockZkvm {
 #[derive(Default)]
 pub struct MockZkGuest {
     /// Input of the circuit
-    pub input: Vec<u8>,
+    pub input: RwLock<Cursor<Vec<u8>>>,
     /// Output of the circuit wrapped in RwLock for thread safe mutability
     pub output: RwLock<Vec<u8>>,
 }
@@ -235,7 +237,7 @@ impl MockZkGuest {
     /// Constructs a new MockZk Guest
     pub fn new(input: Vec<u8>) -> MockZkGuest {
         MockZkGuest {
-            input,
+            input: RwLock::new(Cursor::new(input)),
             output: RwLock::new(vec![]),
         }
     }
@@ -249,6 +251,7 @@ impl sov_rollup_interface::zk::Zkvm for MockZkGuest {
     fn verify(
         serialized_proof: &[u8],
         code_commitment: &Self::CodeCommitment,
+        _allow_dev_mode: bool,
     ) -> Result<(), Self::Error> {
         let proof = MockProof::decode(serialized_proof)?;
         anyhow::ensure!(
@@ -275,15 +278,18 @@ impl sov_rollup_interface::zk::Zkvm for MockZkGuest {
     fn verify_and_deserialize_output<T: BorshDeserialize>(
         serialized_proof: &[u8],
         code_commitment: &Self::CodeCommitment,
+        _allow_dev_mode: bool,
     ) -> Result<T, Self::Error> {
-        Self::verify(serialized_proof, code_commitment)?;
-        Ok(T::deserialize(&mut &serialized_proof[33..])?)
+        Self::verify(serialized_proof, code_commitment, true)?;
+        Self::deserialize_output(&serialized_proof[37..])
     }
 }
 
 impl sov_rollup_interface::zk::ZkvmGuest for MockZkGuest {
     fn read_from_host<T: BorshDeserialize>(&self) -> T {
-        T::try_from_slice(self.input.as_slice()).expect("Failed to deserialize input from host")
+        let mut input = self.input.write().unwrap();
+        BorshDeserialize::deserialize_reader(&mut (*input))
+            .expect("Failed to deserialize input from host")
     }
 
     fn commit<T: BorshSerialize>(&self, item: &T) {

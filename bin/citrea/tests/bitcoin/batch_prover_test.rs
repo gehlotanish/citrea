@@ -1,122 +1,46 @@
+use std::fs;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use alloy_primitives::{Address, U32, U64};
-use anyhow::bail;
+use alloy::consensus::{SignableTransaction, TxLegacy};
+use alloy::network::TxSigner;
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer;
+use alloy_primitives::{Address, Bytes, TxKind, U256, U32, U64};
 use async_trait::async_trait;
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
 use bitcoin::hashes::Hash;
-use bitcoin_da::service::FINALITY_DEPTH;
 use bitcoincore_rpc::RpcApi;
 use citrea_batch_prover::rpc::BatchProverRpcClient;
 use citrea_batch_prover::PartitionMode;
+use citrea_e2e::bitcoin::DEFAULT_FINALITY_DEPTH;
 use citrea_e2e::config::{
     BatchProverConfig, LightClientProverConfig, ProverGuestRunConfig, SequencerConfig,
     SequencerMempoolConfig, TestCaseConfig, TestCaseEnv,
 };
 use citrea_e2e::framework::TestFramework;
-use citrea_e2e::node::{BatchProver, FullNode};
 use citrea_e2e::test_case::{TestCase, TestCaseRunner};
-use citrea_e2e::traits::NodeT;
+use citrea_e2e::traits::{NodeT, Restart};
 use citrea_e2e::Result;
+use citrea_fullnode::rpc::FullNodeRpcClient;
 use citrea_light_client_prover::rpc::LightClientProverRpcClient;
+use citrea_risc0_adapter::host::Risc0Host;
+use citrea_sequencer::SequencerRpcClient;
+use risc0_zkvm::Digest;
+use sov_db::ledger_db::LedgerDB;
+use sov_db::rocks_db_config::RocksdbConfig;
 use sov_ledger_rpc::LedgerRpcClient;
-use sov_rollup_interface::rpc::{JobRpcResponse, VerifiedBatchProofResponse};
-use tokio::time::sleep;
+use sov_modules_api::Zkvm as _;
+use sov_rollup_interface::zk::batch_proof::output::BatchProofCircuitOutput;
+use sov_rollup_interface::zk::{ReceiptType, ZkvmHost};
+use sov_rollup_interface::Network;
 use uuid::Uuid;
 
 use super::get_citrea_path;
+use super::utils::wait_for_zkproofs;
+use crate::bitcoin::utils::{wait_for_prover_job, wait_for_prover_job_count};
 use crate::common::make_test_client;
-
-pub async fn wait_for_zkproofs(
-    full_node: &FullNode,
-    height: u64,
-    timeout: Option<Duration>,
-    count: usize,
-) -> Result<Vec<VerifiedBatchProofResponse>> {
-    let start = Instant::now();
-    let timeout = timeout.unwrap_or(Duration::from_secs(240));
-
-    loop {
-        if start.elapsed() >= timeout {
-            bail!("FullNode failed to get zkproofs within the specified timeout");
-        }
-
-        match full_node
-            .client
-            .http_client()
-            .get_verified_batch_proofs_by_slot_height(U64::from(height))
-            .await?
-        {
-            Some(proofs) => {
-                if proofs.len() >= count {
-                    return Ok(proofs);
-                }
-            }
-            None => sleep(Duration::from_millis(500)).await,
-        }
-    }
-}
-
-/// Wait for prover job to finish.
-pub async fn wait_for_prover_job(
-    batch_prover: &BatchProver,
-    job_id: Uuid,
-    timeout: Option<Duration>,
-) -> Result<JobRpcResponse> {
-    let start = Instant::now();
-    let timeout = timeout.unwrap_or(Duration::from_secs(300));
-    loop {
-        let response = batch_prover
-            .client
-            .http_client()
-            .get_proving_job(job_id)
-            .await?;
-        if let Some(response) = response {
-            if let Some(proof) = &response.proof {
-                if proof.l1_tx_id.is_some() {
-                    return Ok(response);
-                }
-            }
-        }
-
-        let now = Instant::now();
-        if start + timeout <= now {
-            bail!("Timeout. Failed to get prover job {}", job_id);
-        }
-
-        sleep(Duration::from_secs(1)).await;
-    }
-}
-
-pub async fn wait_for_prover_job_count(
-    batch_prover: &BatchProver,
-    count: usize,
-    timeout: Option<Duration>,
-) -> Result<Vec<Uuid>> {
-    let start = Instant::now();
-    let timeout = timeout.unwrap_or(Duration::from_secs(240));
-
-    loop {
-        if start.elapsed() >= timeout {
-            bail!(
-                "BatchProver failed to reach proving job count {} on time",
-                count
-            );
-        }
-
-        let job_ids = batch_prover
-            .client
-            .http_client()
-            .get_proving_jobs(count)
-            .await
-            .unwrap();
-        if job_ids.len() >= count {
-            return Ok(job_ids);
-        }
-
-        sleep(Duration::from_millis(500)).await;
-    }
-}
 
 /// This is a basic prover test showcasing spawning a bitcoin node as DA, a sequencer and a prover.
 /// It generates l2 blocks and wait until it reaches the first commitment.
@@ -153,7 +77,7 @@ impl TestCase for BasicProverTest {
         // Wait for blob inscribe tx to be in mempool
         da.wait_mempool_len(4, None).await?;
 
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
         let finalized_height = da.get_finalized_height(None).await?;
 
         batch_prover
@@ -164,10 +88,10 @@ impl TestCase for BasicProverTest {
         // Wait for batch proof tx to hit mempool
         da.wait_mempool_len(2, None).await?;
 
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
         let proofs = wait_for_zkproofs(
             full_node,
-            finalized_height + FINALITY_DEPTH,
+            finalized_height + DEFAULT_FINALITY_DEPTH,
             Some(Duration::from_secs(120)),
             1,
         )
@@ -218,7 +142,7 @@ impl TestCase for BasicProverTest {
 
         // Wait for blob inscribe tx to be in mempool
         da.wait_mempool_len(4, None).await?;
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
         let finalized_height = da.get_finalized_height(None).await?;
 
         batch_prover
@@ -227,7 +151,7 @@ impl TestCase for BasicProverTest {
         // Wait for batch proof tx to hit mempool
         da.wait_mempool_len(2, None).await?;
 
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
         let finalized_height = da.get_finalized_height(None).await?;
         full_node.wait_for_l1_height(finalized_height, None).await?;
 
@@ -327,7 +251,7 @@ async fn basic_prover_test() -> Result<()> {
 //             .spawn(|tk| bitcoin_da_service.clone().run_da_queue(rx, tk));
 
 //         // Generate FINALIZED DA block.
-//         da.generate(FINALITY_DEPTH).await?;
+//         da.generate(DEFAULT_FINALITY_DEPTH).await?;
 
 //         let max_l2_blocks_per_commitment = sequencer.max_l2_blocks_per_commitment();
 
@@ -338,7 +262,7 @@ async fn basic_prover_test() -> Result<()> {
 //         // Wait for blob inscribe tx to be in mempool
 //         da.wait_mempool_len(2, None).await?;
 
-//         da.generate(FINALITY_DEPTH).await?;
+//         da.generate(DEFAULT_FINALITY_DEPTH).await?;
 
 //         let finalized_height = da.get_finalized_height(None).await?;
 //         batch_prover
@@ -348,8 +272,8 @@ async fn basic_prover_test() -> Result<()> {
 //         // Wait for batch proof tx to hit mempool
 //         da.wait_mempool_len(2, None).await?;
 
-//         da.generate(FINALITY_DEPTH).await?;
-//         let _proofs = wait_for_zkproofs(full_node, finalized_height + FINALITY_DEPTH, None, 1)
+//         da.generate(DEFAULT_FINALITY_DEPTH).await?;
+//         let _proofs = wait_for_zkproofs(full_node, finalized_height + DEFAULT_FINALITY_DEPTH, None, 1)
 //             .await
 //             .unwrap();
 
@@ -405,7 +329,7 @@ async fn basic_prover_test() -> Result<()> {
 //         // Wait for the sequencer commitment to be submitted & accepted.
 //         da.wait_mempool_len(4, None).await?;
 
-//         da.generate(FINALITY_DEPTH).await?;
+//         da.generate(DEFAULT_FINALITY_DEPTH).await?;
 //         let finalized_height = da.get_finalized_height(None).await?;
 
 //         batch_prover
@@ -415,7 +339,7 @@ async fn basic_prover_test() -> Result<()> {
 //         // Wait for batch proof tx to hit mempool
 //         da.wait_mempool_len(2, None).await?;
 
-//         da.generate(FINALITY_DEPTH).await?;
+//         da.generate(DEFAULT_FINALITY_DEPTH).await?;
 //         let finalized_height = da.get_finalized_height(None).await?;
 
 //         // Wait for the full node to see all process verify and store all batch proofs
@@ -510,7 +434,7 @@ impl TestCase for LocalProvingTest {
         da.wait_mempool_len(2, None).await?;
 
         // Make commitment tx into a finalized block
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
 
         let finalized_height = da.get_finalized_height(None).await?;
         // Wait for batch prover to process the proof
@@ -522,7 +446,7 @@ impl TestCase for LocalProvingTest {
         da.wait_mempool_len(2, None).await?;
 
         // Make batch proof tx into a finalized block
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
 
         let finalized_height = da.get_finalized_height(None).await?;
         // Wait for full node to see zkproofs
@@ -556,7 +480,7 @@ struct ParallelProvingTest;
 impl TestCase for ParallelProvingTest {
     fn test_env() -> TestCaseEnv {
         TestCaseEnv {
-            test: vec![("RISC0_DEV_MODE", "1"), ("PARALLEL_PROOF_LIMIT", "2")],
+            test: vec![("PARALLEL_PROOF_LIMIT", "2")],
             ..Default::default()
         }
     }
@@ -617,7 +541,7 @@ impl TestCase for ParallelProvingTest {
             .await?;
 
         // Write commitments to a finalized DA block
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
         let finalized_height = da.get_finalized_height(None).await?;
 
         // Wait until batch prover processes the commitments
@@ -630,7 +554,7 @@ impl TestCase for ParallelProvingTest {
             .await?;
 
         // Write 2 batch proofs (4 txs) to a finalized DA block
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
         let finalized_height = da.get_finalized_height(None).await?;
 
         // Retrieve proofs from fullnode
@@ -804,7 +728,7 @@ async fn parallel_proving_test() -> Result<()> {
 
 //         da.wait_mempool_len(6, None).await?;
 
-//         da.generate(FINALITY_DEPTH).await?;
+//         da.generate(DEFAULT_FINALITY_DEPTH).await?;
 
 //         let finalized_height = da.get_finalized_height(None).await?;
 
@@ -814,12 +738,12 @@ async fn parallel_proving_test() -> Result<()> {
 
 //         // Wait for batch proof tx to hit mempool
 //         da.wait_mempool_len(6, None).await?;
-//         da.generate(FINALITY_DEPTH).await?;
+//         da.generate(DEFAULT_FINALITY_DEPTH).await?;
 
 //         full_node
-//             .wait_for_l1_height(finalized_height + FINALITY_DEPTH, None)
+//             .wait_for_l1_height(finalized_height + DEFAULT_FINALITY_DEPTH, None)
 //             .await?;
-//         let proofs = wait_for_zkproofs(full_node, finalized_height + FINALITY_DEPTH, None, 3)
+//         let proofs = wait_for_zkproofs(full_node, finalized_height + DEFAULT_FINALITY_DEPTH, None, 3)
 //             .await
 //             .unwrap();
 
@@ -852,12 +776,12 @@ async fn parallel_proving_test() -> Result<()> {
 //         );
 
 //         light_client_prover
-//             .wait_for_l1_height(finalized_height + FINALITY_DEPTH, None)
+//             .wait_for_l1_height(finalized_height + DEFAULT_FINALITY_DEPTH, None)
 //             .await?;
 //         let lcp = light_client_prover
 //             .client
 //             .http_client()
-//             .get_light_client_proof_by_l1_height(finalized_height + FINALITY_DEPTH)
+//             .get_light_client_proof_by_l1_height(finalized_height + DEFAULT_FINALITY_DEPTH)
 //             .await
 //             .unwrap()
 //             .unwrap();
@@ -876,7 +800,7 @@ async fn parallel_proving_test() -> Result<()> {
 //     }
 // }
 
-// // ignoring this test now as we won't be supporting backwards compatability for proofs.
+// // ignoring this test now as we won't be supporting backwards compatibility for proofs.
 // #[tokio::test]
 // #[ignore]
 // async fn test_fork_elf_switching() -> Result<()> {
@@ -933,7 +857,7 @@ impl TestCase for L1HashOutputTest {
         // Wait for commitment tx
         da.wait_mempool_len(2, None).await?;
 
-        da.generate(FINALITY_DEPTH).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
 
         let finalized_height = da.get_finalized_height(None).await?;
         // Wait for prover to see the commitments
@@ -993,7 +917,7 @@ impl TestCase for L1HashOutputTest {
         // First, finalize the commitments with l1 update
         da.generate_block(temp_addr, commitments_with_l1_update)
             .await?;
-        da.generate(FINALITY_DEPTH - 1).await?;
+        da.generate(DEFAULT_FINALITY_DEPTH - 1).await?;
 
         // Wait for 2nd proving job to start
         let job_ids = wait_for_prover_job_count(batch_prover, 2, None)
@@ -1103,7 +1027,7 @@ impl TestCase for SubmitFakeProofRpcTest {
         // wait for 1 commitment txs to hit DA
         da.wait_mempool_len(2, None).await.unwrap();
         // finalize 1 commitment
-        da.generate(FINALITY_DEPTH).await.unwrap();
+        da.generate(DEFAULT_FINALITY_DEPTH).await.unwrap();
 
         let finalized_height = da.get_finalized_height(None).await.unwrap();
         // ensure batch prover saw 1 commitment
@@ -1123,7 +1047,7 @@ impl TestCase for SubmitFakeProofRpcTest {
         // wait for 1 proof txs to hit DA
         da.wait_mempool_len(2, None).await.unwrap();
         // finalize 1 proof
-        da.generate(FINALITY_DEPTH).await.unwrap();
+        da.generate(DEFAULT_FINALITY_DEPTH).await.unwrap();
 
         let finalized_height = da.get_finalized_height(None).await.unwrap();
         // ensure light client processed the proof
@@ -1136,7 +1060,7 @@ impl TestCase for SubmitFakeProofRpcTest {
         let lcp_output = light_client
             .client
             .http_client()
-            .get_light_client_proof_by_l1_height(finalized_height)
+            .get_light_client_proof_by_l1_height(U64::from(finalized_height))
             .await?
             .unwrap()
             .light_client_proof_output;
@@ -1153,7 +1077,7 @@ impl TestCase for SubmitFakeProofRpcTest {
         // wait for 3 commitment txs to hit DA
         da.wait_mempool_len(6, None).await.unwrap();
         // finalize 3 commitments
-        da.generate(FINALITY_DEPTH).await.unwrap();
+        da.generate(DEFAULT_FINALITY_DEPTH).await.unwrap();
 
         let finalized_height = da.get_finalized_height(None).await.unwrap();
         // ensure batch prover saw 3 commitments
@@ -1173,7 +1097,7 @@ impl TestCase for SubmitFakeProofRpcTest {
         // wait for 1 proof txs to hit DA
         da.wait_mempool_len(2, None).await.unwrap();
         // finalize 1 proof
-        da.generate(FINALITY_DEPTH).await.unwrap();
+        da.generate(DEFAULT_FINALITY_DEPTH).await.unwrap();
 
         let finalized_height = da.get_finalized_height(None).await.unwrap();
         // ensure light client processed the proof
@@ -1186,7 +1110,7 @@ impl TestCase for SubmitFakeProofRpcTest {
         let lcp_output = light_client
             .client
             .http_client()
-            .get_light_client_proof_by_l1_height(finalized_height)
+            .get_light_client_proof_by_l1_height(U64::from(finalized_height))
             .await?
             .unwrap()
             .light_client_proof_output;
@@ -1204,7 +1128,7 @@ impl TestCase for SubmitFakeProofRpcTest {
         // wait for 1 proof txs to hit DA
         da.wait_mempool_len(2, None).await.unwrap();
         // finalize 1 proof
-        da.generate(FINALITY_DEPTH).await.unwrap();
+        da.generate(DEFAULT_FINALITY_DEPTH).await.unwrap();
 
         let finalized_height = da.get_finalized_height(None).await.unwrap();
         // ensure light client processed the proof
@@ -1217,7 +1141,7 @@ impl TestCase for SubmitFakeProofRpcTest {
         let lcp_output = light_client
             .client
             .http_client()
-            .get_light_client_proof_by_l1_height(finalized_height)
+            .get_light_client_proof_by_l1_height(U64::from(finalized_height))
             .await?
             .unwrap()
             .light_client_proof_output;
@@ -1247,7 +1171,7 @@ impl TestCase for SubmitFakeProofRpcTest {
         // wait for 1 commitment txs to hit DA
         da.wait_mempool_len(2, None).await.unwrap();
         // finalize 1 commitment
-        da.generate(FINALITY_DEPTH).await.unwrap();
+        da.generate(DEFAULT_FINALITY_DEPTH).await.unwrap();
 
         let finalized_height = da.get_finalized_height(None).await.unwrap();
         // ensure batch prover saw 1 commitment
@@ -1288,6 +1212,277 @@ impl TestCase for SubmitFakeProofRpcTest {
 #[tokio::test]
 async fn test_batch_prover_submit_fake_proof_rpc() -> Result<()> {
     TestCaseRunner::new(SubmitFakeProofRpcTest)
+        .set_citrea_path(get_citrea_path())
+        .run()
+        .await
+}
+struct BatchProverCreateInputTest;
+
+#[async_trait]
+impl TestCase for BatchProverCreateInputTest {
+    fn test_config() -> TestCaseConfig {
+        TestCaseConfig {
+            with_batch_prover: true,
+            ..Default::default()
+        }
+    }
+
+    async fn run_test(&mut self, f: &mut TestFramework) -> Result<()> {
+        let batch_prover = f.batch_prover.as_mut().unwrap();
+        let sequencer = f.sequencer.as_mut().unwrap();
+        let da = f.bitcoin_nodes.get(0).unwrap();
+
+        // Generate commitments to create input for proving
+        let max_l2_blocks_per_commitment = sequencer.max_l2_blocks_per_commitment();
+        for _ in 0..max_l2_blocks_per_commitment {
+            sequencer.client.send_publish_batch_request().await?;
+        }
+
+        // Wait for commitment transactions to hit the mempool
+        da.wait_mempool_len(2, None).await?;
+
+        // Finalize the commitments
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
+        let finalized_height = da.get_finalized_height(None).await?;
+
+        // Ensure the batch prover sees the finalized commitments
+        batch_prover
+            .wait_for_l1_height(finalized_height, None)
+            .await?;
+
+        // Call batchProver_createInput to generate input for proving
+        let inputs = batch_prover
+            .client
+            .http_client()
+            .create_circuit_input(0, 1, PartitionMode::Normal)
+            .await?;
+
+        assert_eq!(inputs.len(), 1);
+
+        let code_commitment = Digest::new(citrea_risc0_batch_proof::BATCH_PROOF_BITCOIN_ID);
+
+        // Instantiate Risc0Host
+        let rocksdb_config = RocksdbConfig::new(batch_prover.config.dir(), None, None);
+        let network = Network::Nightly;
+
+        let ledger_db = LedgerDB::with_config(&rocksdb_config).unwrap();
+        let mut risc0_host = Risc0Host::new(ledger_db, network);
+
+        for input in inputs {
+            // Decode raw circuit input
+            let raw_input = BASE64_STANDARD.decode(input).unwrap();
+
+            // Add input to Risc0Host
+            risc0_host.add_hint(raw_input);
+
+            // Run the proof generation
+            let proof = risc0_host
+                .run(
+                    Uuid::new_v4(),
+                    citrea_risc0_batch_proof::BATCH_PROOF_BITCOIN_ELF.to_vec(),
+                    ReceiptType::Groth16,
+                    false,
+                )
+                .expect("Proof generation failed")
+                .await
+                .expect("Proof channel should not close");
+
+            let proof = proof.proof;
+            let output: BatchProofCircuitOutput = Risc0Host::extract_output(&proof).unwrap();
+
+            // Verify the proof
+            Risc0Host::verify(proof.as_slice(), &code_commitment, true)
+                .expect("Proof verification failed");
+
+            assert_eq!(output.last_l2_height(), max_l2_blocks_per_commitment);
+            assert_eq!(output.sequencer_commitment_index_range(), (1, 1));
+
+            let commitment = sequencer
+                .client
+                .http_client()
+                .get_sequencer_commitment_by_index(U32::from(1))
+                .await?
+                .unwrap();
+            let l2_block = sequencer
+                .client
+                .http_client()
+                .get_l2_block_by_number(U64::from(commitment.l2_end_block_number))
+                .await?
+                .unwrap();
+            let state_roots = output.state_roots().clone();
+            assert_eq!(state_roots[1], l2_block.header.state_root);
+        }
+
+        sequencer.wait_until_stopped().await?;
+        batch_prover.wait_until_stopped().await?;
+
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn batch_prover_create_input_test() -> Result<()> {
+    TestCaseRunner::new(BatchProverCreateInputTest)
+        .set_citrea_path(get_citrea_path())
+        .run()
+        .await
+}
+
+struct InvokeCachePruningTest;
+
+#[async_trait]
+impl TestCase for InvokeCachePruningTest {
+    fn test_config() -> TestCaseConfig {
+        TestCaseConfig {
+            with_batch_prover: true,
+            with_full_node: true,
+            ..Default::default()
+        }
+    }
+
+    fn sequencer_config() -> SequencerConfig {
+        SequencerConfig {
+            max_l2_blocks_per_commitment: 60,
+            mempool_conf: SequencerMempoolConfig {
+                pending_tx_limit: 1_000_000,
+                pending_tx_size: 100_000_000,
+                queue_tx_limit: 1_000_000,
+                queue_tx_size: 100_000_000,
+                base_fee_tx_limit: 1_000_000,
+                base_fee_tx_size: 100_000_000,
+                max_account_slots: 1_000_000,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn scan_l1_start_height() -> Option<u64> {
+        Some(170)
+    }
+
+    async fn run_test(&mut self, f: &mut TestFramework) -> Result<()> {
+        let da = f.bitcoin_nodes.get(0).unwrap();
+        let sequencer = f.sequencer.as_mut().unwrap();
+        let batch_prover = f.batch_prover.as_mut().unwrap();
+        let full_node = f.full_node.as_mut().unwrap();
+
+        let signed_txs = self.create_deploy_transactions().await;
+        for signed_tx in signed_txs {
+            sequencer
+                .client
+                .http_client()
+                .eth_send_raw_transaction(signed_tx.into())
+                .await
+                .unwrap();
+        }
+
+        let max_l2_blocks_per_commitment = sequencer.max_l2_blocks_per_commitment();
+        // we publish 60 blocks, but actually, 55th block hits state diff
+        for _ in 0..max_l2_blocks_per_commitment {
+            sequencer.client.send_publish_batch_request().await?;
+        }
+
+        sequencer
+            .wait_for_l2_height(max_l2_blocks_per_commitment, None)
+            .await
+            .unwrap();
+
+        // Wait for commitment transactions to hit the mempool
+        da.wait_mempool_len(2, None).await?;
+
+        // Finalize the commitments
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
+        let finalized_height = da.get_finalized_height(None).await?;
+
+        // Ensure the batch prover sees the finalized commitments
+        batch_prover
+            .wait_for_l1_height(finalized_height, None)
+            .await?;
+
+        // Wait for batch proof transactions to hit the mempool
+        // In this proof, cache limit of 6MB will be hit and pruning will occur.
+        // If the proving session ended successfully, we are gucci
+        da.wait_mempool_len(2, None).await?;
+
+        // Finalize the zk proof
+        da.generate(DEFAULT_FINALITY_DEPTH).await?;
+        let finalized_height = da.get_finalized_height(None).await?;
+
+        // Wait for full node to see and process zk proof
+        full_node
+            .wait_for_l1_height(finalized_height, None)
+            .await
+            .unwrap();
+
+        let last_proven_l2_data = full_node
+            .client
+            .http_client()
+            .get_last_proven_l2_height()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_proven_l2_data.commitment_index, 1);
+        assert_eq!(last_proven_l2_data.height, 55);
+
+        Ok(())
+    }
+}
+
+impl InvokeCachePruningTest {
+    async fn create_deploy_transactions(&self) -> Vec<Vec<u8>> {
+        // 11 tx fits into a single block
+        const DEPLOY_COUNT: usize = 60 * 11;
+
+        let bytecode_hex = fs::read_to_string("tests/bitcoin/test-data/big-contract.bin").unwrap();
+        let bytecode_size = bytecode_hex.len() / 2;
+
+        // extra 32 bytes for constructor argument
+        let mut bytecode_with_args = vec![0; bytecode_size + 32];
+        hex::decode_to_slice(bytecode_hex, &mut bytecode_with_args[0..bytecode_size]).unwrap();
+
+        // prepare signer
+        let private_key: [u8; 32] =
+            hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let mut signer = PrivateKeySigner::from_slice(&private_key).unwrap();
+        signer.set_chain_id(Some(5655));
+
+        let mut signed_txs = Vec::with_capacity(DEPLOY_COUNT);
+        for i in 0..DEPLOY_COUNT {
+            // set constructor argument different for each contract.
+            // since constructor argument sets immutable storage variable
+            // this will make bytecode of each contract different
+            bytecode_with_args[bytecode_size..]
+                .copy_from_slice(U256::from(i).to_be_bytes::<32>().as_slice());
+
+            let mut tx = TxLegacy {
+                chain_id: Some(5655),
+                nonce: i as u64,
+                gas_price: 1_000_000_000 * 1_000_000_000, // 1_000_000_000 gwei
+                gas_limit: 3_000_000,                     // 3 million gas
+                to: TxKind::Create,
+                value: U256::ZERO,
+                input: Bytes::copy_from_slice(&bytecode_with_args),
+            };
+
+            let signature = signer.sign_transaction(&mut tx).await.unwrap();
+            let signed_tx = tx.into_signed(signature);
+
+            let mut rlp_buf = Vec::with_capacity(signed_tx.rlp_encoded_length());
+            signed_tx.rlp_encode(&mut rlp_buf);
+
+            signed_txs.push(rlp_buf);
+        }
+
+        signed_txs
+    }
+}
+
+#[tokio::test]
+async fn invoke_cache_prune_test() -> Result<()> {
+    TestCaseRunner::new(InvokeCachePruningTest)
         .set_citrea_path(get_citrea_path())
         .run()
         .await
